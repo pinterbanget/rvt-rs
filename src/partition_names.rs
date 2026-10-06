@@ -332,6 +332,39 @@ pub fn find_element_data_names(
 pub const ELEMENT_DATA_HEADER_2023: [u8; 10] =
     [0xff, 0xff, 0xff, 0xff, 0xc0, 0x02, 0x01, 0x00, 0x00, 0x00];
 
+/// The schema tag of `CellList` on each release, the `u16` of the
+/// element-data header, as read from each release's own `Formats/Latest`
+/// by `examples/probe_r1_schema_tags.rs` on Autodesk's `rac_basic` sample of
+/// 2016 to 2027. The 2023 to 2026 values are the ones RE-111, #322 and
+/// RE-124 measured; 2016 to 2022 are new here.
+pub fn cell_list_tag(revit_version: u32) -> Option<u16> {
+    match revit_version {
+        2016 => Some(0x0255),
+        2017 => Some(0x025d),
+        2018 => Some(0x0263),
+        2019 => Some(0x0264),
+        2020 => Some(0x026c),
+        2021 => Some(0x027d),
+        2022 => Some(0x028d),
+        2023 => Some(0x02c0),
+        2024 => Some(0x02d3),
+        2025 => Some(0x02ef),
+        2026 => Some(0x02fd),
+        _ => None,
+    }
+}
+
+/// The element-data header of a 32-bit release (2016 to 2023), whose
+/// ElementId after it is a `u32` and four more bytes (RE-111); `None` on
+/// any other release.
+pub fn element_data_header_32(revit_version: u32) -> Option<[u8; 10]> {
+    if !crate::partition_element_records_2023::reads_release(revit_version) {
+        return None;
+    }
+    let [lo, hi] = cell_list_tag(revit_version)?.to_le_bytes();
+    Some([0xff, 0xff, 0xff, 0xff, lo, hi, 0x01, 0x00, 0x00, 0x00])
+}
+
 /// How an element's serialised data opens on a release: its header and the
 /// width of the ElementId after it (RE-111). On every release the data
 /// proper starts 8 bytes past the id's first byte: a `u64` id, or a `u32`
@@ -357,22 +390,36 @@ impl ElementDataLayout {
 
 /// The [`ElementDataLayout`] of `revit_version`, where it is measured.
 pub fn element_data_layout(revit_version: u32) -> Option<ElementDataLayout> {
-    match revit_version {
-        2023 => Some(ElementDataLayout {
-            header: ELEMENT_DATA_HEADER_2023,
-            wide_id: false,
-        }),
-        _ => element_data_header(revit_version).map(|header| ElementDataLayout {
+    if let Some(header) = element_data_header_32(revit_version) {
+        return Some(ElementDataLayout {
             header,
-            wide_id: true,
-        }),
+            wide_id: false,
+        });
     }
+    element_data_header(revit_version).map(|header| ElementDataLayout {
+        header,
+        wide_id: true,
+    })
 }
 
 /// [`find_element_data_names`] on Revit 2023 (RE-111): the header is
 /// [`ELEMENT_DATA_HEADER_2023`] and the ElementId a `u32`.
 pub fn find_element_data_names_2023(buf: &[u8], wanted: &BTreeSet<u32>) -> BTreeMap<u32, String> {
     element_data_names(buf, &ELEMENT_DATA_HEADER_2023, wanted, read_u32)
+}
+
+/// [`find_element_data_names_2023`] on any 32-bit release (2016 to 2023),
+/// with that release's header ([`element_data_header_32`]). Empty on any
+/// other release.
+pub fn find_element_data_names_32(
+    buf: &[u8],
+    revit_version: u32,
+    wanted: &BTreeSet<u32>,
+) -> BTreeMap<u32, String> {
+    match element_data_header_32(revit_version) {
+        Some(header) => element_data_names(buf, &header, wanted, read_u32),
+        None => BTreeMap::new(),
+    }
 }
 
 fn element_data_names(

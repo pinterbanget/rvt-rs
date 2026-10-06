@@ -152,7 +152,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Releases where this framing is corpus-proven: 2024 on Core Interior
 /// (RE-24) and Snowdon Towers, 2025 on RE1 Architecture (RE-51), and 2023
 /// on two projects in its 32-bit form (RE-107).
-pub const PARTITION_LEVEL_SUPPORTED_REVIT_VERSIONS: &[u32] = &[2023, 2024, 2025, 2026];
+pub const PARTITION_LEVEL_SUPPORTED_REVIT_VERSIONS: &[u32] = &[
+    2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026,
+];
 
 /// The release whose Level records and name blocks carry 32-bit
 /// ElementIds (RE-107).
@@ -836,7 +838,7 @@ fn level_records(
     revit_version: u32,
     declared_ids: &BTreeSet<u32>,
 ) -> Vec<PartitionLevelRecord> {
-    if revit_version == REVIT_2023 {
+    if crate::partition_element_records_2023::reads_release(revit_version) {
         let Some((full, header_tag)) = crate::partition_element_records_2023::record_marker(rf)
         else {
             return Vec::new();
@@ -923,7 +925,7 @@ pub fn scan_partition_levels(
             .unwrap_or(0);
         let mut blocks = Vec::new();
         let buf = inflated.bytes();
-        if revit_version == REVIT_2023 {
+        if crate::partition_element_records_2023::reads_release(revit_version) {
             // No Level inside another element is measured on 2023.
             blocks.extend(find_name_blocks_sized(
                 buf,

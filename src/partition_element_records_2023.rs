@@ -33,6 +33,19 @@ use std::collections::BTreeSet;
 /// The release this layout is measured on.
 pub const REVIT_2023: u32 = 2023;
 
+/// Releases read with this 32-bit envelope. RE-81 measured it on 2023
+/// against Revit's own export. RE-140 found the same chain, marker and
+/// fields on Autodesk's 2016 to 2022 sample projects, where they agree with
+/// 2024's reading of the same model on category (99.9 to 100 per cent) and
+/// box (89.6 to 100); the 2016 to 2022 releases are read here against that
+/// cross-release answer key, not against a Revit export.
+pub const ENVELOPE_RELEASES: std::ops::RangeInclusive<u32> = 2016..=REVIT_2023;
+
+/// Whether `revit_version`'s element records are read with this envelope.
+pub fn reads_release(revit_version: u32) -> bool {
+    ENVELOPE_RELEASES.contains(&revit_version)
+}
+
 /// Bytes from the ElementId to the marker.
 const ID_BEFORE_MARKER: usize = 52;
 /// Bytes from the `BuiltInCategory` to the marker.
@@ -68,7 +81,7 @@ pub fn record_marker(rf: &mut RevitFile) -> Option<([u8; 8], u16)> {
 /// Every 2023 element record in the file whose ElementId is declared in
 /// `Global/ElemTable`. Empty for any other release (fail closed).
 pub fn scan_records(rf: &mut RevitFile, revit_version: u32) -> Vec<PartitionElementRecord> {
-    if revit_version != REVIT_2023 {
+    if !reads_release(revit_version) {
         return Vec::new();
     }
     let Ok(table) = crate::elem_table::parse_records(rf) else {

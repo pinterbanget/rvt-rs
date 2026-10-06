@@ -157,7 +157,7 @@ pub fn scan_material_appearances(
     revit_version: u32,
     declared: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, MaterialAppearance>> {
-    if revit_version == 2023 {
+    if crate::partition_element_records_2023::reads_release(revit_version) {
         return Ok(scan_material_appearances_2023(rf, declared));
     }
     let Some(tag) = material_object_tag(revit_version) else {
@@ -506,6 +506,22 @@ pub const MATERIAL_TAG_2023: [u8; 2] = [0xfb, 0x09];
 /// See [`MATERIAL_TAG_2023`].
 pub const MATERIAL_TAG_OFFSET_2023: usize = 0x27;
 
+/// The tag of class `name` in `rf`'s own schema, little-endian.
+///
+/// [`MATERIAL_TAG_2023`] is the tag of `Material` on Revit 2023, as `0x0a28`
+/// is on 2024, and the `ff ff ff ff eb 0b` a 2023 name ends before frames
+/// `PhysicalParamSet` (`0x0c17` on 2024). Read from the schema, the readers
+/// below carry to every 32-bit release (2016 to 2022 give `Material`
+/// `0x088b` to `0x09af`), where a hardcoded tag matches nothing.
+fn class_tag_bytes(rf: &mut RevitFile, name: &str) -> Option<[u8; 2]> {
+    let classes = rf.schema_classes().ok()?;
+    classes
+        .classes
+        .iter()
+        .find(|class| class.name == name)
+        .map(|class| class.tag.to_le_bytes())
+}
+
 /// Every Revit 2023 material, by ElementId, with its name where it is read
 /// (RE-113). A material is an object `01 00 00 00 · u32 id` carrying
 /// [`MATERIAL_TAG_2023`], whether it opens an element's data or sits inside
@@ -526,6 +542,11 @@ pub fn scan_materials_2023(
     declared: &BTreeSet<u32>,
 ) -> (BTreeSet<u32>, BTreeMap<u32, String>) {
     const PREFIX: [u8; 7] = [0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+    let revit_version = rf.basic_file_info().map_or(0, |b| b.version);
+    let material_tag = class_tag_bytes(rf, "Material").unwrap_or(MATERIAL_TAG_2023);
+    let terminator = class_tag_bytes(rf, "PhysicalParamSet")
+        .map(|[lo, hi]| [0xff, 0xff, 0xff, 0xff, lo, hi])
+        .unwrap_or([0xff, 0xff, 0xff, 0xff, 0xeb, 0x0b]);
     let mut entry = i32::try_from(NAME_PARAMETER)
         .expect("a 32-bit BuiltInParameter")
         .to_le_bytes()
@@ -538,7 +559,7 @@ pub fn scan_materials_2023(
             continue;
         };
         let buf = inflated.bytes();
-        for tag_at in memchr::memmem::find_iter(buf, &MATERIAL_TAG_2023) {
+        for tag_at in memchr::memmem::find_iter(buf, &material_tag) {
             let Some(id_at) = tag_at.checked_sub(MATERIAL_TAG_OFFSET_2023) else {
                 continue;
             };
@@ -555,7 +576,7 @@ pub fn scan_materials_2023(
             let end = id_at.saturating_add(NAME_WINDOW).min(buf.len());
             let object = &buf[tag_at + 2..end];
             let name = own_name_field(object)
-                .or_else(|| terminated_name_2023(object))
+                .or_else(|| terminated_name_2023(object, &terminator))
                 .or_else(|| {
                     memchr::memmem::find_iter(object, &entry).find_map(|hit| {
                         let n = u32_at(object, hit + entry.len())?;
@@ -588,9 +609,11 @@ pub fn scan_materials_2023(
         .collect();
     for stream in rf.partition_stream_names() {
         if let Ok(inflated) = rf.inflated_partition(&stream) {
-            for (id, name) in
-                crate::partition_names::find_element_data_names_2023(inflated.bytes(), &unnamed)
-            {
+            for (id, name) in crate::partition_names::find_element_data_names_32(
+                inflated.bytes(),
+                revit_version,
+                &unnamed,
+            ) {
                 names.entry(id).or_insert(name);
             }
         }
@@ -653,13 +676,14 @@ fn scan_material_appearances_2023(
     declared: &BTreeSet<u32>,
 ) -> BTreeMap<u32, MaterialAppearance> {
     const PREFIX: [u8; 7] = [0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+    let material_tag = class_tag_bytes(rf, "Material").unwrap_or(MATERIAL_TAG_2023);
     let mut found: BTreeMap<u32, Option<MaterialAppearance>> = BTreeMap::new();
     for stream in rf.partition_stream_names() {
         let Ok(inflated) = rf.inflated_partition(&stream) else {
             continue;
         };
         let buf = inflated.bytes();
-        for tag_at in memchr::memmem::find_iter(buf, &MATERIAL_TAG_2023) {
+        for tag_at in memchr::memmem::find_iter(buf, &material_tag) {
             let Some(id_at) = tag_at.checked_sub(MATERIAL_TAG_OFFSET_2023) else {
                 continue;
             };
@@ -697,11 +721,11 @@ fn scan_material_appearances_2023(
         .collect()
 }
 
-/// The name `u32 n · UTF-16 × n` ending right before the first `ff ff ff ff
-/// eb 0b` in `object` (RE-116), where exactly one length fits.
-fn terminated_name_2023(object: &[u8]) -> Option<String> {
-    const TERMINATOR: [u8; 6] = [0xff, 0xff, 0xff, 0xff, 0xeb, 0x0b];
-    let end = memchr::memmem::find(object, &TERMINATOR)?;
+/// The name `u32 n · UTF-16 × n` ending right before the first
+/// `terminator` in `object` (RE-116), `ff ff ff ff` and the tag of
+/// `PhysicalParamSet` (`eb 0b` on 2023), where exactly one length fits.
+fn terminated_name_2023(object: &[u8], terminator: &[u8; 6]) -> Option<String> {
+    let end = memchr::memmem::find(object, terminator)?;
     let mut names = (1..=256u32).filter_map(|n| {
         let at = end.checked_sub(4 + 2 * n as usize)?;
         (u32_at(object, at)? == n)

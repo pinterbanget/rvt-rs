@@ -122,7 +122,10 @@ pub struct LayerLayout {
 /// The layer record layout of `revit_version`, where it is measured.
 pub fn layer_layout(revit_version: u32) -> Option<LayerLayout> {
     match revit_version {
-        2023 => Some(LayerLayout {
+        // The 32-bit releases share 2023's record (RE-112): the same six
+        // layers of `rac_basic`'s `SIP 202mm` wall type read alike from
+        // 2016 to 2023.
+        2016..=2023 => Some(LayerLayout {
             record_len: 29,
             function_at: 8,
             material_at: 16,
@@ -163,8 +166,19 @@ pub const MAX_NAME_UNITS: usize = 256;
 pub const WALL_FLIP_ANCHOR: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00];
 
 /// The tag framing a type's layer count on `revit_version`.
+///
+/// 2016 to 2022 are measured on Autodesk's `rac_basic` sample of each
+/// release: the `SIP 202mm` wall type (ElementId 428955) frames its six
+/// layers with these tags, at the place 2023 frames them with `0x106f`.
 pub fn layer_frame_tag(revit_version: u32) -> Option<[u8; 2]> {
     match revit_version {
+        2016 => Some([0x06, 0x0e]),
+        2017 => Some([0x5e, 0x0e]),
+        2018 => Some([0xeb, 0x0e]),
+        2019 => Some([0x37, 0x0f]),
+        2020 => Some([0x76, 0x0f]),
+        2021 => Some([0x79, 0x0f]),
+        2022 => Some([0x03, 0x10]),
         2023 => Some([0x6f, 0x10]),
         2024 => Some([0xa6, 0x10]),
         2025 => Some([0x0e, 0x11]),
@@ -299,11 +313,9 @@ pub fn scan_type_layers(
     materials: &BTreeSet<u32>,
     declared: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, Vec<CompoundLayer>>> {
-    // Revit 2023's data header frames a `u32` id (RE-111).
-    let header = match revit_version {
-        2023 => Some(crate::partition_names::ELEMENT_DATA_HEADER_2023),
-        _ => crate::partition_names::element_data_header(revit_version),
-    };
+    // A 32-bit release's data header frames a `u32` id (RE-111).
+    let header = crate::partition_names::element_data_header_32(revit_version)
+        .or_else(|| crate::partition_names::element_data_header(revit_version));
     let (Some(header), Some(tag), Some(layout)) = (
         header,
         layer_frame_tag(revit_version),
