@@ -265,6 +265,10 @@ pub fn recover_partition_schema_mvp(
             &mut out.products,
             [&mut out.doors, &mut out.windows],
         );
+        // Doors and windows in the nearest listed wall that is not a curtain
+        // wall, once curtain walls are known, as on 2024 (#439).
+        bind_opening_hosts(&out.walls, &mut out.doors);
+        bind_opening_hosts(&out.walls, &mut out.windows);
         attach_instance_axes(
             rf,
             revit_version,
@@ -6006,8 +6010,6 @@ fn recover_2023_records(rf: &mut RevitFile, revit_version: u32, out: &mut Partit
             attach_host_candidates(record, &wall_ids, element);
         }
     }
-    bind_opening_hosts(&out.walls, &mut out.doors);
-    bind_opening_hosts(&out.walls, &mut out.windows);
 }
 
 /// ElementIds of the instances in `selected` nested in a door or window
