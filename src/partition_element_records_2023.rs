@@ -185,6 +185,12 @@ fn decode_at_marker(
 }
 
 /// A `u32`-counted list of `u32` ElementIds at `at`, widened to `u64`.
+/// The reference list of the record whose ElementId is at `id_at` (its
+/// `offset`): the `u32` list after the box, 52 + 8 + 48 bytes on.
+pub fn reference_list_at(buf: &[u8], id_at: usize) -> Option<Vec<u64>> {
+    u32_list(buf, id_at.checked_add(ID_BEFORE_MARKER + 8 + 48)?)
+}
+
 fn u32_list(buf: &[u8], at: usize) -> Option<Vec<u64>> {
     let count = u32::from_le_bytes(buf.get(at..at + 4)?.try_into().ok()?) as usize;
     if count > MAX_REFERENCES {

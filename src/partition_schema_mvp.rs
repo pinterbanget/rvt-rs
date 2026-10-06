@@ -232,6 +232,14 @@ pub fn recover_partition_schema_mvp(
                 attach_revit_classes(&classes, elements);
             }
         }
+        // Curtain walls and their panels and mullions (RE-46).
+        attach_curtain_walls(
+            rf,
+            revit_version,
+            &mut out.walls,
+            &mut out.products,
+            [&mut out.doors, &mut out.windows],
+        );
         attach_instance_axes(
             rf,
             revit_version,
@@ -2337,13 +2345,23 @@ fn record_references(rf: &mut RevitFile, element: &DecodedElement) -> Option<(Ve
             _ => {}
         }
     }
+    let narrow = rf
+        .basic_file_info()
+        .is_ok_and(|b| crate::partition_element_records_2023::reads_release(b.version));
     let inflated = rf.inflated_partition(&stream?).ok()?;
-    let references = offset?
-        .checked_add(crate::partition_element_records::REFERENCE_LIST_OFFSET)
-        .and_then(|at| {
-            crate::partition_element_records::decode_reference_list(inflated.bytes(), at)
-        })
-        .unwrap_or_default();
+    // A 32-bit record's offset is its ElementId's and its list holds `u32`s
+    // (RE-81).
+    let references = if narrow {
+        crate::partition_element_records_2023::reference_list_at(inflated.bytes(), offset?)
+            .unwrap_or_default()
+    } else {
+        offset?
+            .checked_add(crate::partition_element_records::REFERENCE_LIST_OFFSET)
+            .and_then(|at| {
+                crate::partition_element_records::decode_reference_list(inflated.bytes(), at)
+            })
+            .unwrap_or_default()
+    };
     Some((references, category?))
 }
 
@@ -6122,6 +6140,16 @@ fn system_type_names_2023(
             }
         }
     }
+    // A Level and a material are named in their element data too, and a
+    // wall's record names its Level and can name a layer's material: on
+    // `rac_basic`, Level 1 (named by no window) kept walls 198749 and 422243
+    // from their type, and a cladding material, named by walls alone, took
+    // wall 655533's. Neither is ever a system-family type.
+    let not_types: BTreeSet<u32> = level_element_ids(rf, revit_version)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(crate::partition_materials::scan_materials_2023(rf, &declared).0)
+        .collect();
     let mut out = BTreeMap::new();
     for record in records.iter().filter(|record| {
         record.is_exported_instance()
@@ -6131,6 +6159,7 @@ fn system_type_names_2023(
             .references
             .iter()
             .filter_map(|&reference| u32::try_from(reference).ok())
+            .filter(|id| !not_types.contains(id))
             .filter(|id| matches!(names.get(id), Some(Some(_))))
             .collect();
         let most_specific = candidates.iter().copied().filter(|id| {

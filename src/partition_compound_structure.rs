@@ -591,12 +591,13 @@ pub fn scan_wall_joined_entries(
     walls: &BTreeSet<u32>,
     read: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, WallJoinedEntries>> {
-    let (Some(header), Some(count_at)) = (
-        crate::partition_names::element_data_header(revit_version),
+    let (Some(layout), Some(count_at)) = (
+        crate::partition_names::element_data_layout(revit_version),
         wall_join_count_offset(revit_version),
     ) else {
         return Ok(BTreeMap::new());
     };
+    let header = layout.header;
     let mut lists: BTreeMap<u32, Option<WallJoinLists>> = BTreeMap::new();
     // Each copy of a wall's data: its partition and byte range.
     let mut copies: Vec<(u32, String, std::ops::Range<usize>)> = Vec::new();
@@ -608,10 +609,7 @@ pub fn scan_wall_joined_entries(
         let hits: Vec<usize> = memchr::memmem::find_iter(buf, &header).collect();
         for (index, &hit) in hits.iter().enumerate() {
             let id_at = hit + header.len();
-            let Some(id) = u64_at(buf, id_at)
-                .and_then(|id| u32::try_from(id).ok())
-                .filter(|id| read.contains(id))
-            else {
+            let Some(id) = layout.id_at(buf, id_at).filter(|id| read.contains(id)) else {
                 continue;
             };
             let end = hits
@@ -764,13 +762,26 @@ pub fn scan_wall_type_face_angles(
 /// Where a join list's count sits past its opening word on
 /// `revit_version`: Revit 2025 puts a zero `u32` before it (RE-70).
 /// `None` where the layout is not measured.
+///
+/// A 32-bit release (2016 to 2023) puts a `u32` and 13 zero bytes before
+/// it, so it sits at [`WALL_JOIN_COUNT_AT_32`], and its entries are
+/// `u32 · u32 ElementId · u32`. Measured on `rac_basic` 2016 and 2022, whose
+/// wall 198694 holds the same lists as its 2024 copy: (0x10f, 428745, 8)
+/// and (0x221, 428745, 8), then (0x149, 428588, 7).
 pub fn wall_join_count_offset(revit_version: u32) -> Option<usize> {
     match revit_version {
+        2016..=2023 => Some(WALL_JOIN_COUNT_AT_32),
         2024 => Some(12),
         2025 | 2026 => Some(16),
         _ => None,
     }
 }
+
+/// Where a 32-bit release's join-list count sits past its opening word.
+pub const WALL_JOIN_COUNT_AT_32: usize = 29;
+
+/// Bytes per join-list entry on a 32-bit release: `u32 · u32 ElementId · u32`.
+pub const WALL_JOIN_ENTRY_LEN_32: usize = 12;
 
 /// The word that opens a wall's join list (RE-70).
 pub const WALL_JOIN_LIST_WORD: [u8; 4] = [0x07, 0x00, 0x00, 0x00];
@@ -809,17 +820,26 @@ pub fn wall_join_lists(
             continue;
         };
         let count = count as usize;
+        let narrow = count_at == WALL_JOIN_COUNT_AT_32;
         if count == 0
             || count > MAX_WALL_JOIN_ENTRIES
-            || (count_at > 12 && u32_at(data, at + 12) != Some(0))
+            || (!narrow && count_at > 12 && u32_at(data, at + 12) != Some(0))
+            || (narrow
+                && data
+                    .get(at + 16..at + count_at)
+                    .is_none_or(|run| run.iter().any(|&b| b != 0)))
         {
             continue;
         }
         let named: Option<Vec<u32>> = (0..count)
             .map(|index| {
-                u64_at(data, at + count_at + 8 + index * WALL_JOIN_ENTRY_LEN)
-                    .and_then(|id| u32::try_from(id).ok())
-                    .filter(|id| walls.contains(id))
+                if narrow {
+                    u32_at(data, at + count_at + 8 + index * WALL_JOIN_ENTRY_LEN_32)
+                } else {
+                    u64_at(data, at + count_at + 8 + index * WALL_JOIN_ENTRY_LEN)
+                        .and_then(|id| u32::try_from(id).ok())
+                }
+                .filter(|id| walls.contains(id))
             })
             .collect();
         if let Some(named) = named {
@@ -844,12 +864,13 @@ pub fn scan_wall_join_partners(
     walls: &BTreeSet<u32>,
     read: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, BTreeSet<u32>>> {
-    let (Some(header), Some(count_at)) = (
-        crate::partition_names::element_data_header(revit_version),
+    let (Some(layout), Some(count_at)) = (
+        crate::partition_names::element_data_layout(revit_version),
         wall_join_count_offset(revit_version),
     ) else {
         return Ok(BTreeMap::new());
     };
+    let header = layout.header;
     let mut found: BTreeMap<u32, Option<WallJoinLists>> = BTreeMap::new();
     for stream in rf.partition_stream_names() {
         let Ok(inflated) = rf.inflated_partition(&stream) else {
@@ -859,10 +880,7 @@ pub fn scan_wall_join_partners(
         let hits: Vec<usize> = memchr::memmem::find_iter(buf, &header).collect();
         for (index, &hit) in hits.iter().enumerate() {
             let id_at = hit + header.len();
-            let Some(id) = u64_at(buf, id_at)
-                .and_then(|id| u32::try_from(id).ok())
-                .filter(|id| read.contains(id))
-            else {
+            let Some(id) = layout.id_at(buf, id_at).filter(|id| read.contains(id)) else {
                 continue;
             };
             let end = hits
