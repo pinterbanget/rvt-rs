@@ -1,7 +1,7 @@
 # R3: shapes for Revit 2016 to 2022
 
 **Date:** 2026-10-06
-**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`, `f4175e3`
+**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`, `f4175e3`, and for Revit 2016's sections the commit after `1705a4a`
 **Status:** positive. On 2016 to 2022, the 32-bit route now draws real shapes from three decoders the 2024 route already had. The share of real shapes is level with the 2024 copy, except for column I-sections.
 **Answer key:** as in R1. Autodesk's three sample projects of each release are joined on ElementId with the 2024 copy's export. Scored with `tools/re/cross_release_vs_reference.py`, which now also reports box agreement where both exports draw an element the same way ("same-body").
 **Probes:**
@@ -41,6 +41,12 @@
    - **Curtain walls.** `record_references` reads a 32-bit record's `u32` list, and the 32-bit route attaches curtain walls (RE-46).
    - **Result.** On 2016 and 2022 every wall and curtain wall that both exports hold agrees with 2024 in class, body source and box: 47 of 47 on `rac_basic`, 146 of 146 on `rac_advanced`.
 
+7. **Revit 2016's steel sections.** 2016 writes no section BuiltInParameters.
+   - Its section types hold the same sizes as family parameters whose `ParamElemFamily` captions are `bf`, `d`, `tw` and `tf`.
+   - `native_i_sections` reads them from the native graph. In place of the centroid test it requires the type's own solid to be doubly symmetric (`native_section_doubly_symmetric`).
+   - On `rst_basic` 2016 it picks exactly the two types 2017's centroid test reads as I sections. The 17 columns are drawn as on 2017 to 2024, each within 0.01 ft of 2024's box.
+   - `rst_basic` 2016's real shapes are 80.4 % against 2024's 80.6 %, and storeys 100 %.
+
 ## Default export against the 2024 copy
 
 "Real shape" counts a body that is not the record's box, cut or trimmed: walls along their centreline, beams along their axis, saved meshes. Record boxes trimmed at joins or cut at columns count as boxes.
@@ -51,7 +57,7 @@ As of `f4175e3`:
 |---|---|---|---|---|---|
 | rac_basic | 2016 to 2017 | 100 % | 5.4 / 5.4 % | 99.3 to 99.6 % | 99.3 to 99.6 % of 452 |
 | rac_basic | 2018 to 2023 | 100 % | 5.4 / 5.4 % | 100 % | 100 % of 452 |
-| rst_basic | 2016 | 100 % | 76.6 / 80.6 % | 96.5 % | 97.0 % of 428 |
+| rst_basic | 2016 | 100 % | 80.4 / 80.6 % | 96.5 % | 97.1 % of 445 |
 | rst_basic | 2017 to 2023 | 100 % | 80.2 to 80.4 / 80.4 to 80.6 % | 99.3 % | 100 % of 445 to 446 |
 | rac_advanced | 2016 to 2020 | 100 % | 2.6 / 2.6 % | 97.1 % | 97.1 % of 5,554 |
 | rac_advanced | 2021 to 2023 | 100 % | 2.3 to 2.6 / 2.7 % | 99.6 to 99.9 % | 99.9 to 100 % of 5,598 to 5,613 |
@@ -80,5 +86,4 @@ The 32-bit exports draw slightly more elements from saved meshes than 2024's do.
 
 ## Not done
 
-- **Revit 2016 column sections.** A section's sizes there are the family's own parameters, not BuiltInParameters.
 - **Slabs, roofs and stairs** are boxes on both sides on these models; the sketch readers were not opened to the 32-bit route.
