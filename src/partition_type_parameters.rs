@@ -528,3 +528,203 @@ fn value_blocks(buf: &[u8], declared_ids: &BTreeSet<u32>) -> Vec<(usize, Option<
         })
         .collect()
 }
+
+/// Family-parameter captions of a steel section's width, depth, web and
+/// flange thickness, as a steel family names its own parameters where Revit
+/// has no section BuiltInParameters (Revit 2016; they first appear in 2017):
+/// `bf`, `d`, `tw` and `tf` on Autodesk's `rst_basic` 2016, whose
+/// `200UB25.4` type holds the values its 2017 copy holds under
+/// [`SECTION_WIDTH_PARAMETER`] and the rest.
+const SECTION_CAPTIONS: [(&str, usize); 4] = [("bf", 0), ("d", 1), ("tw", 2), ("tf", 3)];
+
+/// Whether a type's own solid (its native graph's `Plane` faces) is
+/// symmetric about its centre across the extrusion both ways: every side
+/// face, projected onto the section plane, has its mirror image across each
+/// axis. An I section's are; a channel's, tee's or angle's are not.
+/// `None` where the graph holds no side faces along one axis.
+pub fn native_section_doubly_symmetric(
+    graph: &crate::native_parameters::ObjectGraph,
+) -> Option<bool> {
+    let vec3 = |value: &serde_json::Value| -> Option<[f64; 3]> {
+        let a = value.as_array()?;
+        Some([
+            a.first()?.as_f64()?,
+            a.get(1)?.as_f64()?,
+            a.get(2)?.as_f64()?,
+        ])
+    };
+    // Each face: origin, u axis, v axis, u range.
+    let mut faces = Vec::new();
+    for object in graph.objects.iter().filter(|o| o.class_name == "Plane") {
+        let f = &object.fields;
+        let (Some(o), Some(x), Some(y)) =
+            (vec3(&f["m_origin"]), vec3(&f["m_xVec"]), vec3(&f["m_yVec"]))
+        else {
+            continue;
+        };
+        let corners = f["m_Envelope"]["m_corners"].as_array()?;
+        let u0 = corners.first()?.get(0)?.as_f64()?;
+        let u1 = corners.get(1)?.get(0)?.as_f64()?;
+        faces.push((o, x, y, u0, u1));
+    }
+    // The extrusion axis: the coordinate axis most faces run along in v.
+    let mut votes = [0usize; 3];
+    for (_, _, y, _, _) in &faces {
+        if let Some(axis) = (0..3).find(|&a| y[a].abs() > 0.999) {
+            votes[axis] += 1;
+        }
+    }
+    let axis = (0..3).max_by_key(|&a| votes[a])?;
+    let (i, j) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let segments: Vec<[[f64; 2]; 2]> = faces
+        .iter()
+        .filter(|(_, x, y, _, _)| y[axis].abs() > 0.999 && x[axis].abs() < 1e-6)
+        .map(|(o, x, _, u0, u1)| {
+            let at = |u: f64| [o[i] + u * x[i], o[j] + u * x[j]];
+            [at(*u0), at(*u1)]
+        })
+        .collect();
+    if segments.len() < 4 {
+        return None;
+    }
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for p in segments.iter().flatten() {
+        for k in 0..2 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+    const TOLERANCE: f64 = 1e-4;
+    let same = |a: [f64; 2], b: [f64; 2]| {
+        (a[0] - b[0]).abs() < TOLERANCE && (a[1] - b[1]).abs() < TOLERANCE
+    };
+    let has = |s: [[f64; 2]; 2]| {
+        segments.iter().any(|t| {
+            (same(s[0], t[0]) && same(s[1], t[1])) || (same(s[0], t[1]) && same(s[1], t[0]))
+        })
+    };
+    let mirrored = |k: usize| {
+        segments.iter().all(|s| {
+            let m = |p: [f64; 2]| {
+                let mut q = p;
+                q[k] = 2.0 * centre[k] - p[k];
+                q
+            };
+            has([m(s[0]), m(s[1])])
+        })
+    };
+    Some(mirrored(0) && mirrored(1))
+}
+
+/// The I section of each type in `types` from the native object graph, for
+/// a release whose section types hold their sizes as family parameters
+/// rather than BuiltInParameters (Revit 2016): the values of the
+/// `FamilyParams` entries whose parameter element (`ParamElemFamily`) is
+/// captioned `bf`, `d`, `tw` and `tf`, where the type's own solid is
+/// doubly symmetric ([`native_section_doubly_symmetric`]), as the
+/// centroid test of [`type_i_sections`] requires on later releases.
+pub fn native_i_sections(rf: &mut RevitFile, types: &BTreeSet<u32>) -> BTreeMap<u32, ISection> {
+    let graphs = |rf: &mut RevitFile, ids: BTreeSet<u64>| {
+        let mut out = BTreeMap::new();
+        if ids.is_empty() {
+            return out;
+        }
+        let options = crate::native_document::Options {
+            selected_ids: ids,
+            channels: BTreeSet::from([102]),
+            max_graph_values: 1_000_000,
+            max_graph_objects: 1_000_000,
+            ..Default::default()
+        };
+        let _ = crate::native_document::extract(rf, &options, |record| {
+            if let (Ok(id), Some(graph)) = (u32::try_from(record.identity.element_id), record.graph)
+            {
+                out.insert(id, graph);
+            }
+            Ok(())
+        });
+        out
+    };
+    let type_graphs = graphs(rf, types.iter().map(|&t| u64::from(t)).collect());
+    // Each type's family-parameter values, by parameter ElementId.
+    let mut values: BTreeMap<u32, BTreeMap<u32, f64>> = BTreeMap::new();
+    for (&type_id, graph) in &type_graphs {
+        for object in graph
+            .objects
+            .iter()
+            .filter(|o| o.class_name == "FamilyParams")
+        {
+            for entry in object.fields["m_params"].as_array().into_iter().flatten() {
+                let (Ok(parameter), Some(value)) = (
+                    crate::native_metadata::identifier(&entry["m_paramId"]),
+                    entry["m_value"].as_f64(),
+                ) else {
+                    continue;
+                };
+                if let Ok(parameter) = u32::try_from(parameter) {
+                    values.entry(type_id).or_default().insert(parameter, value);
+                }
+            }
+        }
+    }
+    let parameters: BTreeSet<u64> = values
+        .values()
+        .flat_map(|held| held.keys())
+        .map(|&p| u64::from(p))
+        .collect();
+    let caption: BTreeMap<u32, String> = graphs(rf, parameters)
+        .iter()
+        .filter_map(|(&id, graph)| {
+            let definition = graph
+                .objects
+                .iter()
+                .find(|o| o.class_name == "ParamDefValue")?;
+            Some((id, definition.fields["m_caption"].as_str()?.to_string()))
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    for (type_id, held) in values {
+        let mut sizes = [None; 4];
+        for (parameter, value) in held {
+            if let Some(&(_, slot)) = caption
+                .get(&parameter)
+                .and_then(|c| SECTION_CAPTIONS.iter().find(|(name, _)| name == c))
+            {
+                sizes[slot] = Some(value);
+            }
+        }
+        let [
+            Some(width_feet),
+            Some(depth_feet),
+            Some(web_feet),
+            Some(flange_feet),
+        ] = sizes
+        else {
+            continue;
+        };
+        let section = ISection {
+            width_feet,
+            depth_feet,
+            web_feet,
+            flange_feet,
+        };
+        let symmetric = type_graphs
+            .get(&type_id)
+            .and_then(native_section_doubly_symmetric)
+            == Some(true);
+        if symmetric
+            && section.web_feet > 0.0
+            && section.flange_feet > 0.0
+            && section.web_feet < section.width_feet
+            && 2.0 * section.flange_feet < section.depth_feet
+        {
+            out.insert(type_id, section);
+        }
+    }
+    out
+}

@@ -30,6 +30,49 @@ fn main() -> anyhow::Result<()> {
             record.graph.is_some()
         );
         if let Some(graph) = &record.graph {
+            if std::env::var_os("CLASSES").is_some() {
+                let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+                for o in &graph.objects {
+                    *counts.entry(o.class_name.as_str()).or_default() += 1;
+                }
+                println!("  classes {counts:?}");
+                for o in graph
+                    .objects
+                    .iter()
+                    .filter(|o| o.class_name == "Plane")
+                    .take(16)
+                {
+                    let text = serde_json::to_string(&o.fields)?;
+                    println!("  Plane {}", text.chars().take(420).collect::<String>());
+                }
+                for o in graph
+                    .objects
+                    .iter()
+                    .filter(|o| o.class_name == "GLine")
+                    .take(40)
+                {
+                    println!(
+                        "  GLine origin {} dir {} params {}",
+                        o.fields["m_origin"], o.fields["m_dirVec"], o.fields["m_endParams"]
+                    );
+                }
+                return Ok(());
+            }
+            if std::env::var_os("PARAMS").is_some() {
+                for object in graph
+                    .objects
+                    .iter()
+                    .filter(|o| o.class_name == "FamilyParams")
+                {
+                    for p in object.fields["m_params"].as_array().into_iter().flatten() {
+                        println!(
+                            "  param {} value {} int {} str {:?} elem {}",
+                            p["m_paramId"], p["m_value"], p["m_int"], p["m_str"], p["m_elemId"]
+                        );
+                    }
+                }
+                return Ok(());
+            }
             if let Ok(needle) = std::env::var("FIND") {
                 for (index, object) in graph.objects.iter().enumerate() {
                     let text = serde_json::to_string(&object.fields)?;

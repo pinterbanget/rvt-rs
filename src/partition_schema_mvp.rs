@@ -1815,7 +1815,20 @@ fn attach_beam_sections(rf: &mut RevitFile, revit_version: u32, products: &mut [
         .filter(|element| I_SECTION_CLASSES.contains(&element.class.as_str()))
         .filter_map(type_of)
         .collect();
-    let sections = crate::partition_type_parameters::type_i_sections(rf, revit_version, &types);
+    let mut sections = crate::partition_type_parameters::type_i_sections(rf, revit_version, &types);
+    // A 32-bit release's type whose section is not held as BuiltInParameters
+    // (every type on Revit 2016) is read from its family parameters.
+    if crate::partition_element_records_2023::reads_release(revit_version) {
+        let missing: BTreeSet<u32> = types
+            .iter()
+            .copied()
+            .filter(|t| !sections.contains_key(t))
+            .collect();
+        for (type_id, section) in crate::partition_type_parameters::native_i_sections(rf, &missing)
+        {
+            sections.entry(type_id).or_insert(section);
+        }
+    }
     let columns: BTreeSet<u32> = products
         .iter()
         .filter(|element| element.class == "StructuralColumn")
