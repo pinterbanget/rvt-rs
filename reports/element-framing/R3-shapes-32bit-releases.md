@@ -1,7 +1,7 @@
 # R3: shapes for Revit 2016 to 2022
 
 **Date:** 2026-10-06
-**Branch:** `phase-r/r1-identity` (fork), commit `a1a3e2c`
+**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`
 **Status:** positive. On 2016 to 2022, the 32-bit route now draws real shapes from three decoders the 2024 route already had. The share of real shapes is level with the 2024 copy, except for column I-sections.
 **Answer key:** as in R1. Autodesk's three sample projects of each release are joined on ElementId with the 2024 copy's export. Scored with `tools/re/cross_release_vs_reference.py`, which now also reports box agreement where both exports draw an element the same way ("same-body").
 **Probes:**
@@ -25,17 +25,28 @@
    - 2016 to 2020 are read without the word, every wall vertical (word 1). Read as 2021's, 11 of the 56 orientations failed to parse and the others read word 0.
    - `rac_basic` 2016 to 2022 now draw 18 walls from their centreline (2024: 25). Of the 40 walls drawn as 2024 draws them, 38 agree with 2024's box within 0.01 ft.
 
+4. **Turned family instances and curtain members.** `partition_instance_transforms` reads the 32-bit data header and `u32` id.
+   - The 31 turned instances of `rac_basic` read the same transform on 2016, 2022 and 2024 (`examples/probe_r3_transforms.rs`).
+   - The 32-bit route now attaches each record's Revit class (RE-76), which `attach_instance_axes` keys on, and curtain members' axes (RE-106).
+   - On 2016 and 2022, `rac_basic` draws its 31 turned instances turned, and `rac_advanced` its 148 oriented curtain members and 3 turned instances, as 2024 does.
+5. **I sections from type parameters.**
+   - On a 32-bit release a type's value block opens with a `u32` ElementId, 28 × `0xff` and 3 zero bytes, and a length entry is `f64 · ff × 4 · i32 parameter`.
+   - `rst_basic` 2022's section types hold the same Width, Height and thicknesses as their 2024 copies (43, 43, 37 and 37 entries on each).
+   - Its 17 I-section columns are drawn on 2017 to 2022.
+   - Revit 2016 writes none of the structural section BuiltInParameters; they first appear in 2017. So 2016's columns keep their box.
+
 ## Default export against the 2024 copy
 
 "Real shape" counts a body that is not the record's box, cut or trimmed: walls along their centreline, beams along their axis, saved meshes. Record boxes trimmed at joins or cut at columns count as boxes.
 
 | model | releases | real shape (test / 2024) | box | same-body box |
 |---|---|---|---|---|
-| rac_basic | 2016 to 2017 | 3.9 / 5.4 % | 97.6 to 97.8 % | 98.8 to 99.0 % of 414 |
-| rac_basic | 2018 to 2023 | 3.9 / 5.4 % | 98.2 % | 99.5 % of 414 |
-| rst_basic | 2016 to 2023 | 76.4 to 76.6 / 80.4 to 80.6 % | 96.5 to 99.3 % | 97.0 to 100 % of 428 to 429 |
-| rac_advanced | 2016 to 2020 | 2.2 / 2.6 % | 96.5 % | 96.9 % of 5,370 |
-| rac_advanced | 2021 to 2023 | 2.2 / 2.7 % | 99.1 to 99.4 % | 99.9 % of 5,414 to 5,429 |
+| rac_basic | 2016 to 2017 | 3.9 / 5.4 % | 97.6 to 97.8 % | 98.9 to 99.1 % of 445 |
+| rac_basic | 2018 to 2023 | 3.9 / 5.4 % | 98.2 % | 99.6 % of 445 |
+| rst_basic | 2016 | 76.6 / 80.6 % | 96.5 % | 97.0 % of 428 |
+| rst_basic | 2017 to 2023 | 80.2 to 80.4 / 80.4 to 80.6 % | 99.3 % | 100 % of 445 to 446 |
+| rac_advanced | 2016 to 2020 | 2.2 / 2.6 % | 96.5 % | 97.0 % of 5,521 |
+| rac_advanced | 2021 to 2023 | 1.9 to 2.2 / 2.7 % | 99.1 to 99.4 % | 99.9 % of 5,565 to 5,580 |
 
 Before R3, real shapes were 0 % on every 32-bit release, and box agreement 93.6 to 97.9 %.
 
@@ -49,7 +60,6 @@ Exports of 2024 files are byte-identical apart from timestamps, with or without 
 
 ## Not done
 
-- **Column I-sections** (`rst_basic` 2024: 17 columns). `attach_beam_sections` reads the type's section from 2024's type records, which the 32-bit releases do not write in that form.
-- **Turned and oriented family-instance boxes** (`rac_basic` 2024: 31; `rac_advanced`: 148). `scan_instance_transforms` reads a 64-bit data header. With `--saved-meshes` most of these are meshes anyway.
+- **Revit 2016 column sections.** A section's sizes there are the family's own parameters, not BuiltInParameters.
 - **Seven walls 2024 draws from their centreline stay record boxes**, and two of the 40 compared walls differ.
 - **Slabs, roofs and stairs** are boxes on both sides on these models; the sketch readers were not opened to the 32-bit route.
