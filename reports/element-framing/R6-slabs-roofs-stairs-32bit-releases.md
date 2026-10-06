@@ -1,7 +1,7 @@
 # R6: floors, roofs, ceilings and stairs for Revit 2016 to 2022
 
 **Date:** 2026-10-06
-**Branch:** `phase-r/r1-identity` (fork)
+**Branch:** `phase-r/r1-identity` (fork), commits `7e2ed88`, `8db39b3`, `7b66a3e`
 **Status:** positive.
 - On 2016 to 2023, floors, building pads, roofs and ceilings are drawn from their sketches, and straight stair runs from their treads and risers, as 2024's decoders draw them.
 - Every outline and run both exports draw agrees with the 2024 copy, except where Autodesk edited the model after 2020.
