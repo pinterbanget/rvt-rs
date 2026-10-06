@@ -40,6 +40,18 @@ pub const TYPE_TEXT_PARAMETERS: &[(i64, &str)] = &[
 /// Longest value read, in UTF-16 units.
 const MAX_VALUE_UNITS: usize = 400;
 
+/// The bytes that follow a `u32` ElementId to open its value block on a
+/// 32-bit release (2016 to 2023): half the run, as a 2023 Level's name block
+/// halves its own (RE-107). Measured on Autodesk's `rst_basic` 2022, whose
+/// section types (1042289 and the rest) open their blocks so.
+const VALUE_BLOCK_MARK_32: [u8; 31] = {
+    let mut mark = [0xffu8; 31];
+    mark[28] = 0;
+    mark[29] = 0;
+    mark[30] = 0;
+    mark
+};
+
 /// The bytes that follow an ElementId to open its value block.
 const VALUE_BLOCK_MARK: [u8; 59] = {
     let mut mark = [0xffu8; 59];
@@ -179,14 +191,41 @@ pub fn scan_partition_lengths(
     declared_ids: &BTreeSet<u32>,
     parameters: &BTreeSet<i64>,
 ) -> BTreeMap<u32, BTreeMap<i64, f64>> {
-    let blocks = value_blocks(buf, declared_ids);
+    scan_partition_lengths_sized(buf, declared_ids, parameters, false)
+}
+
+/// [`scan_partition_lengths`] on a release whose ids are `u32`s (`narrow`,
+/// 2016 to 2023): an entry is `f64 feet · ff × 4 · i32 parameter` in a
+/// 32-bit value block (`u32` ElementId, 28 × `0xff`, 3 zero bytes). Measured on `rst_basic` 2022, whose section
+/// types hold the same Width, Height and thicknesses as their 2024 copies
+/// (43, 43, 37 and 37 entries on each).
+pub fn scan_partition_lengths_sized(
+    buf: &[u8],
+    declared_ids: &BTreeSet<u32>,
+    parameters: &BTreeSet<i64>,
+    narrow: bool,
+) -> BTreeMap<u32, BTreeMap<i64, f64>> {
+    let blocks = if narrow {
+        value_blocks_32(buf, declared_ids)
+    } else {
+        value_blocks(buf, declared_ids)
+    };
+    let gap = if narrow { 4 } else { 8 };
     let mut values: BTreeMap<(u32, i64), Option<f64>> = BTreeMap::new();
     for &parameter in parameters {
-        for at in memchr::memmem::find_iter(buf, &parameter.to_le_bytes()) {
+        let needle = if narrow {
+            let Ok(narrow_id) = i32::try_from(parameter) else {
+                continue;
+            };
+            narrow_id.to_le_bytes().to_vec()
+        } else {
+            parameter.to_le_bytes().to_vec()
+        };
+        for at in memchr::memmem::find_iter(buf, &needle) {
             let Some(value) = at
-                .checked_sub(16)
+                .checked_sub(8 + gap)
                 .and_then(|start| buf.get(start..at))
-                .filter(|entry| entry[8..] == [0xff; 8])
+                .filter(|entry| entry[8..].iter().all(|&b| b == 0xff))
                 .map(|entry| f64::from_le_bytes(entry[..8].try_into().expect("8 bytes")))
                 .filter(|value| value.is_finite() && value.abs() <= MAX_LENGTH_FEET)
             else {
@@ -358,7 +397,9 @@ pub fn type_i_sections(
     revit_version: u32,
     types: &BTreeSet<u32>,
 ) -> BTreeMap<u32, ISection> {
-    if bbox_marker(revit_version).is_none() || types.is_empty() {
+    let release_read = bbox_marker(revit_version).is_some()
+        || crate::partition_element_records_2023::reads_release(revit_version);
+    if !release_read || types.is_empty() {
         return BTreeMap::new();
     }
     let Ok(records) = crate::elem_table::parse_records(rf) else {
@@ -411,12 +452,17 @@ fn type_lengths(
     types: &BTreeSet<u32>,
     parameters: &BTreeSet<i64>,
 ) -> BTreeMap<u32, BTreeMap<i64, f64>> {
+    let narrow = rf
+        .basic_file_info()
+        .is_ok_and(|b| crate::partition_element_records_2023::reads_release(b.version));
     let mut values: BTreeMap<u32, BTreeMap<i64, Option<f64>>> = BTreeMap::new();
     for stream in rf.partition_stream_names() {
         let Ok(inflated) = rf.inflated_partition(&stream) else {
             continue;
         };
-        for (owner, found) in scan_partition_lengths(inflated.bytes(), declared, parameters) {
+        for (owner, found) in
+            scan_partition_lengths_sized(inflated.bytes(), declared, parameters, narrow)
+        {
             if !types.contains(&owner) {
                 continue;
             }
@@ -452,6 +498,22 @@ fn type_lengths(
 /// declared a false id 0, read from the bytes after its ElemTable, and the
 /// blocks were cut there; without the cut, RE1 Architecture's curtain wall
 /// type took the next block's `Type Mark`.)
+/// [`value_blocks`] on a 32-bit release: a `u32` ElementId and
+/// [`VALUE_BLOCK_MARK_32`].
+fn value_blocks_32(buf: &[u8], declared_ids: &BTreeSet<u32>) -> Vec<(usize, Option<u32>)> {
+    memchr::memmem::find_iter(buf, &VALUE_BLOCK_MARK_32)
+        .filter(|&at| at >= 4 && buf[at - 1] != 0xff)
+        .filter_map(|at| {
+            let id = u32::from_le_bytes(buf[at - 4..at].try_into().ok()?);
+            if declared_ids.contains(&id) {
+                Some((at, Some(id)))
+            } else {
+                (id == 0).then_some((at, None))
+            }
+        })
+        .collect()
+}
+
 fn value_blocks(buf: &[u8], declared_ids: &BTreeSet<u32>) -> Vec<(usize, Option<u32>)> {
     memchr::memmem::find_iter(buf, &VALUE_BLOCK_MARK)
         .filter(|&at| at >= 8 && buf[at - 1] != 0xff)

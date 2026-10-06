@@ -215,6 +215,30 @@ pub fn recover_partition_schema_mvp(
         ] {
             attach_type_materials(&type_materials, elements);
         }
+        // The Revit class each record names (RE-76), a turned family
+        // instance's plan axis (RE-87), curtain members turned off the model's
+        // axes (RE-106) and steel members' I sections from their type (RE-103,
+        // RE-104), as on 2024.
+        if let Ok(classes) = rf.schema_classes() {
+            for elements in [
+                &mut out.walls,
+                &mut out.columns,
+                &mut out.doors,
+                &mut out.windows,
+                &mut out.slabs,
+                &mut out.rooms,
+                &mut out.products,
+            ] {
+                attach_revit_classes(&classes, elements);
+            }
+        }
+        attach_instance_axes(
+            rf,
+            revit_version,
+            [&mut out.doors, &mut out.windows, &mut out.products],
+        );
+        attach_curtain_axes(rf, revit_version, &mut out.products);
+        attach_beam_sections(rf, revit_version, &mut out.products);
         return Ok(out);
     }
 

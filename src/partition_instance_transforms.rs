@@ -128,9 +128,13 @@ pub fn scan_instance_transforms(
     revit_version: u32,
     ids: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, InstanceTransform>> {
-    let Some(header) = crate::partition_names::element_data_header(revit_version) else {
+    // A 32-bit release's data opens with its header and a `u32` id; the
+    // data proper starts 8 bytes past the id's first byte on every release
+    // ([`crate::partition_names::ElementDataLayout`]).
+    let Some(layout) = crate::partition_names::element_data_layout(revit_version) else {
         return Ok(BTreeMap::new());
     };
+    let header = layout.header;
     let mut found: BTreeMap<u32, Option<InstanceTransform>> = BTreeMap::new();
     for stream in rf.partition_stream_names() {
         let Ok(inflated) = rf.inflated_partition(&stream) else {
@@ -140,12 +144,7 @@ pub fn scan_instance_transforms(
         let hits: Vec<usize> = memchr::memmem::find_iter(buf, &header).collect();
         for (index, &hit) in hits.iter().enumerate() {
             let id_at = hit + header.len();
-            let Some(id) = buf
-                .get(id_at..id_at + 8)
-                .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
-                .and_then(|id| u32::try_from(id).ok())
-                .filter(|id| ids.contains(id))
-            else {
+            let Some(id) = layout.id_at(buf, id_at).filter(|id| ids.contains(id)) else {
                 continue;
             };
             let end = hits
