@@ -171,6 +171,19 @@ pub fn recover_partition_schema_mvp(
         resolve_base_constraint_levels(&level_elevations, &mut record_backed);
         resolve_base_at_level(&level_elevations, &mut record_backed);
         resolve_remaining_levels(&level_elevations, &mut record_backed);
+        // --- Type and family names the records leave out, from the native
+        // object graph ---
+        attach_native_names(
+            rf,
+            &mut [
+                &mut out.walls,
+                &mut out.columns,
+                &mut out.doors,
+                &mut out.windows,
+                &mut out.slabs,
+                &mut out.products,
+            ],
+        );
         // --- System families' names (RE-63); a wall's, roof's or
         // ceiling's needs its type's layers, not read on 2023 ---
         attach_system_family_names(
@@ -215,6 +228,18 @@ pub fn recover_partition_schema_mvp(
         ] {
             attach_type_materials(&type_materials, elements);
         }
+        // Materials the type maps above leave out, from the native object
+        // graph: curtain mullions' and panels' (RE-166) and other types'
+        // geometry materials.
+        attach_native_type_materials(
+            rf,
+            &mut [
+                &mut out.columns,
+                &mut out.doors,
+                &mut out.windows,
+                &mut out.products,
+            ],
+        );
         // The Revit class each record names (RE-76), a turned family
         // instance's plan axis (RE-87), curtain members turned off the model's
         // axes (RE-106) and steel members' I sections from their type (RE-103,
@@ -6075,6 +6100,250 @@ fn select_instance_records(
 /// unique gets nothing.
 /// Categories whose types are system-family types (RE-111): walls, floors,
 /// roofs and ceilings.
+/// The fields an element's own object names its type in: a family
+/// instance's original symbol (`m_masterSymbolId`, the type Revit's export
+/// gives it, RE-167), a stair's `m_typeId`, and a system element's
+/// attributes, such as a floor's `m_floorAttributesId` and a railing's
+/// `m_stairsRailingAttrId`. A curtain mullion's or panel's
+/// `InstanceInfo.m_symbolId` is a per-instance symbol with no name of its
+/// own, so it is read only where none of these is set.
+const NATIVE_TYPE_FIELDS: [&str; 2] = ["m_masterSymbolId", "m_typeId"];
+
+/// The type an element's native graph names, where one of its fields does.
+fn native_type_id(graph: &crate::native_parameters::ObjectGraph) -> Option<u32> {
+    let id = |value: &serde_json::Value| {
+        crate::native_metadata::identifier(value)
+            .ok()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|&id| id > 0)
+    };
+    let root = graph.objects.first()?;
+    let fields = root.fields.as_object()?;
+    NATIVE_TYPE_FIELDS
+        .iter()
+        .find_map(|name| fields.get(*name).and_then(id))
+        .or_else(|| {
+            fields
+                .iter()
+                .filter(|(name, _)| name.ends_with("AttributesId") || name.ends_with("AttrId"))
+                .find_map(|(_, value)| id(value))
+        })
+        .or_else(|| {
+            graph
+                .objects
+                .iter()
+                .find(|object| object.class_name == "InstanceInfo")
+                .and_then(|info| info.fields.get("m_symbolId").and_then(id))
+        })
+}
+
+/// Name each element of `groups` that has no type name yet from the native
+/// object graph (`native_document`, schema-driven on every release): its
+/// type through [`native_type_id`], the type's `SymbolInfo.m_name`, and the
+/// `m_name` of the `Family` its `m_familyId` names, where it names one. A
+/// system family's type names none, and [`attach_system_family_names`]
+/// gives it its family.
+///
+/// On Autodesk's `rac_basic` and `rac_advanced` of 2016 to 2023, this names
+/// the curtain mullions and panels, railings, stairs and loadable families
+/// the records' name entries do not reach, as the 2024 copy of each model
+/// names them.
+fn attach_native_names(rf: &mut RevitFile, groups: &mut [&mut Vec<DecodedElement>]) {
+    let has_name = |element: &DecodedElement| {
+        element
+            .fields
+            .iter()
+            .any(|(name, _)| name == TYPE_NAME_FIELD)
+    };
+    let ids: BTreeSet<u64> = groups
+        .iter()
+        .flat_map(|elements| elements.iter())
+        .filter(|element| !has_name(element))
+        .filter_map(|element| element.id.map(u64::from))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let elements = native_graphs(rf, ids);
+    let types: BTreeMap<u32, u32> = elements
+        .iter()
+        .filter_map(|(&id, graph)| Some((id, native_type_id(graph)?)))
+        .collect();
+    let type_graphs = native_graphs(rf, types.values().map(|&t| u64::from(t)).collect());
+    let symbol_name = |graph: &crate::native_parameters::ObjectGraph| {
+        graph
+            .objects
+            .iter()
+            .find(|object| object.class_name == "SymbolInfo")
+            .and_then(|object| object.fields.get("m_name")?.as_str().map(str::to_string))
+            .filter(|name| !name.is_empty())
+    };
+    let family_of: BTreeMap<u32, u32> = type_graphs
+        .iter()
+        .filter_map(|(&id, graph)| {
+            let family = graph.objects.first()?.fields.get("m_familyId")?;
+            let family = crate::native_metadata::identifier(family).ok()?;
+            Some((id, u32::try_from(family).ok().filter(|&f| f > 0)?))
+        })
+        .collect();
+    let family_graphs = native_graphs(rf, family_of.values().map(|&f| u64::from(f)).collect());
+    let family_name: BTreeMap<u32, String> = family_graphs
+        .iter()
+        .filter_map(|(&id, graph)| {
+            let root = graph.objects.first().filter(|o| o.class_name == "Family")?;
+            let name = root.fields.get("m_name")?.as_str()?.to_string();
+            (!name.is_empty()).then_some((id, name))
+        })
+        .collect();
+    for element in groups.iter_mut().flat_map(|elements| elements.iter_mut()) {
+        if has_name(element) {
+            continue;
+        }
+        let Some(type_id) = element.id.and_then(|id| types.get(&id)).copied() else {
+            continue;
+        };
+        let Some(type_name) = type_graphs.get(&type_id).and_then(symbol_name) else {
+            continue;
+        };
+        element.fields.push((
+            TYPE_ID_FIELD.into(),
+            InstanceField::ElementId {
+                tag: 0,
+                id: type_id,
+            },
+        ));
+        element
+            .fields
+            .push((TYPE_NAME_FIELD.into(), InstanceField::String(type_name)));
+        if let Some(family) = family_of.get(&type_id).and_then(|f| family_name.get(f)) {
+            element.fields.push((
+                FAMILY_NAME_FIELD.into(),
+                InstanceField::String(family.clone()),
+            ));
+        }
+    }
+}
+
+/// The native object graph of each element of `ids` on channel 102, by
+/// ElementId; empty where the file's native records do not read.
+fn native_graphs(
+    rf: &mut RevitFile,
+    ids: BTreeSet<u64>,
+) -> BTreeMap<u32, crate::native_parameters::ObjectGraph> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    let options = crate::native_document::Options {
+        selected_ids: ids,
+        channels: BTreeSet::from([102]),
+        max_graph_values: 1_000_000,
+        max_graph_objects: 1_000_000,
+        ..Default::default()
+    };
+    let _ = crate::native_document::extract(rf, &options, |record| {
+        if let (Ok(id), Some(graph)) = (u32::try_from(record.identity.element_id), record.graph) {
+            out.insert(id, graph);
+        }
+        Ok(())
+    });
+    out
+}
+
+/// Give each element of `groups` that has a type and no material yet its
+/// type's materials, from the native object graph:
+/// - a curtain mullion's or panel's type names its material in
+///   `m_renderStyleId` (the ElementId RE-166 reads 135 bytes into a 2024
+///   `SysMullionFamSym`). On Autodesk's `rac_basic` of 2022 and 2024 both give
+///   mullion type 232770 material 232859, "Metal - Paint Finish - Dark Gray,
+///   Matte", and panel type 232758 material 26, "Glass";
+/// - any other type maps its geometry to materials in `m_geomTag2MaterialId`,
+///   the map RE-82 reads from the type's value block.
+///
+/// Each material is named by its `Material.m_name`.
+fn attach_native_type_materials(rf: &mut RevitFile, groups: &mut [&mut Vec<DecodedElement>]) {
+    let type_of = |element: &DecodedElement| {
+        element.fields.iter().find_map(|(name, value)| match value {
+            InstanceField::ElementId { id, .. } if name == TYPE_ID_FIELD => Some(*id),
+            _ => None,
+        })
+    };
+    let wanted = |element: &DecodedElement| {
+        !element
+            .fields
+            .iter()
+            .any(|(name, _)| name == TYPE_MATERIAL_FIELD || name == TYPE_WITHOUT_GEOMETRY_FIELD)
+    };
+    let types: BTreeSet<u64> = groups
+        .iter()
+        .flat_map(|elements| elements.iter())
+        .filter(|element| wanted(element))
+        .filter_map(type_of)
+        .map(u64::from)
+        .collect();
+    let type_graphs = native_graphs(rf, types);
+    let id = |value: &serde_json::Value| {
+        crate::native_metadata::identifier(value)
+            .ok()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|&id| id > 0)
+    };
+    let materials_of: BTreeMap<u32, Vec<u32>> = type_graphs
+        .iter()
+        .filter_map(|(&type_id, graph)| {
+            let root = graph.objects.first()?;
+            let mut materials: Vec<u32> = Vec::new();
+            if let Some(style) = root.fields.get("m_renderStyleId").and_then(id) {
+                materials.push(style);
+            } else if let Some(map) = root.fields.get("m_geomTag2MaterialId")?.as_array() {
+                for entry in map {
+                    if let Some(material) = entry.get("second").and_then(id) {
+                        if !materials.contains(&material) {
+                            materials.push(material);
+                        }
+                    }
+                }
+            }
+            (!materials.is_empty()).then_some((type_id, materials))
+        })
+        .collect();
+    let all: BTreeSet<u64> = materials_of
+        .values()
+        .flatten()
+        .map(|&m| u64::from(m))
+        .collect();
+    let material_name: BTreeMap<u32, String> = native_graphs(rf, all)
+        .iter()
+        .filter_map(|(&material, graph)| {
+            let object = graph.objects.iter().find(|o| o.class_name == "Material")?;
+            let name = object.fields.get("m_name")?.as_str()?.to_string();
+            (!name.is_empty()).then_some((material, name))
+        })
+        .collect();
+    for element in groups.iter_mut().flat_map(|elements| elements.iter_mut()) {
+        if !wanted(element) {
+            continue;
+        }
+        let Some(materials) = type_of(element).and_then(|t| materials_of.get(&t)) else {
+            continue;
+        };
+        let names: Vec<String> = materials
+            .iter()
+            .filter_map(|m| material_name.get(m).cloned())
+            .collect();
+        // A type whose every material is unnamed keeps none rather than
+        // some.
+        if names.len() != materials.len() {
+            continue;
+        }
+        for name in names {
+            element
+                .fields
+                .push((TYPE_MATERIAL_FIELD.into(), InstanceField::String(name)));
+        }
+    }
+}
+
 const SYSTEM_TYPE_CATEGORIES_2023: [i64; 4] = [
     crate::partition_element_records::OST_WALLS,
     crate::partition_element_records::OST_FLOORS,
