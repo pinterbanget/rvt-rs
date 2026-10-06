@@ -62,6 +62,15 @@ def body_source(e):
     return (ue.get_psets(e).get("RvtElementRecordGeometry") or {}).get("BodySource")
 
 
+# Body sources that are the element record's box, cut or trimmed: placed and
+# sized, but not the element's own shape.
+BOX_SOURCES = ("bbox", "box", "join_trimmed", "join_cut", "column_cut")
+
+
+def is_real_shape(source):
+    return bool(source) and not any(marker in source for marker in BOX_SOURCES)
+
+
 def world_boxes(f, wanted):
     s = ifcopenshell.geom.settings()
     s.set("use-world-coords", True)
@@ -113,12 +122,18 @@ def score(ref_path, test_path, tol):
                 mismatches[field].append({"id": k, "reference": x, "test": y})
         ba, bb = rb.get(a.id()), tb.get(b.id())
         if ba and bb:
+            close = max(abs(p - q) for p, q in zip(ba, bb)) <= tol
             fields["box_scored"] += 1
-            if max(abs(p - q) for p, q in zip(ba, bb)) <= tol:
-                fields["box"] += 1
-            else:
-                mismatches["box"].append({"id": k, "class": a.is_a(), "reference": ba, "test": bb})
-    real = lambda els, ids: sum(1 for k in ids if (body_source(els[k]) or "").find("box") < 0)
+            fields["box"] += close
+            # Where both draw the element the same way, the boxes measure
+            # the decoder; elsewhere they also measure the choice of body.
+            if body_source(a) == body_source(b):
+                fields["same_source_scored"] += 1
+                fields["same_source_box"] += close
+            if not close:
+                mismatches["box"].append({"id": k, "class": a.is_a(), "reference": ba, "test": bb,
+                                          "reference_source": body_source(a), "test_source": body_source(b)})
+    real = lambda els, ids: sum(1 for k in ids if is_real_shape(body_source(els[k])))
     summary = {
         "reference": ref_path,
         "test": test_path,
@@ -135,6 +150,10 @@ def score(ref_path, test_path, tol):
             for f in ("class", "global_id", "name", "storey", "materials")
         },
         "box_agreement": fields["box"] / fields["box_scored"] if fields["box_scored"] else 0.0,
+        "same_source_box_agreement": (
+            fields["same_source_box"] / fields["same_source_scored"] if fields["same_source_scored"] else 0.0
+        ),
+        "same_source_scored": fields["same_source_scored"],
         "reference_storeys": sorted({s.Name for s in ref.by_type("IfcBuildingStorey")}),
         "test_storeys": sorted({s.Name for s in test.by_type("IfcBuildingStorey")}),
         "real_shape_share": {
@@ -157,7 +176,9 @@ def main():
     print(
         f"coverage {summary['coverage']:.1%} ({summary['shared']}/{summary['reference_elements']}, "
         f"+{summary['only_in_test']} extra) | class {a['class']:.1%} name {a['name']:.1%} "
-        f"gid {a['global_id']:.1%} storey {a['storey']:.1%} materials {a['materials']:.1%} box {summary['box_agreement']:.1%} | "
+        f"gid {a['global_id']:.1%} storey {a['storey']:.1%} materials {a['materials']:.1%} "
+        f"box {summary['box_agreement']:.1%} (same body {summary['same_source_box_agreement']:.1%} "
+        f"of {summary['same_source_scored']}) | "
         f"real shape {summary['real_shape_share']['test']:.1%} vs {summary['real_shape_share']['reference']:.1%}"
     )
     if args.json:

@@ -68,7 +68,7 @@ Exports of Einhoven (2023) and of the 2024 files are byte-identical apart from t
 
 - **Shapes.**
   - The 32-bit path draws every element as its record box.
-  - `rst_basic`'s beams, columns and slabs are real shapes on 2024 (82 % of shared elements) and boxes here (9 %).
+  - Real shapes on 2016 to 2022 are 0 % of shared elements, where 2024 draws 5.4 % (`rac_basic`), 80.4 % (`rst_basic`) and 2.7 % (`rac_advanced`) as their own shape. This was corrected from a first count that took trimmed record boxes for shapes. See R3.
 - **Names on `rac_advanced`** (15.6 % on 2023 as well).
   - Curtain-wall members and panels, and families whose type the name entries do not reach.
 - **Materials on `rac_advanced`** (7.5 %).
