@@ -59,7 +59,11 @@ def materials(e):
 
 
 def body_source(e):
-    return (ue.get_psets(e).get("RvtElementRecordGeometry") or {}).get("BodySource")
+    """How the element is drawn: its `BodySource`, or, where its plan outline
+    is its sketch's (a floor's, roof's or ceiling's), its `ProfileSource`."""
+    pset = ue.get_psets(e).get("RvtElementRecordGeometry") or {}
+    profile = pset.get("ProfileSource") or ""
+    return profile if "sketch" in profile else pset.get("BodySource")
 
 
 # Body sources that are the element record's box, cut or trimmed: placed and

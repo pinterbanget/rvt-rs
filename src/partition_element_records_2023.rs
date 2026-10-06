@@ -166,6 +166,7 @@ fn decode_at_marker(
     }
     let list_at = at + 8 + 48;
     let references = u32_list(buf, list_at).unwrap_or_default();
+    let owner_reference = owner_after(buf, list_at);
     Some(PartitionElementRecord {
         stream: stream.to_string(),
         offset: id_at,
@@ -177,10 +178,157 @@ fn decode_at_marker(
         class_tag,
         bbox_feet,
         preceding_reference: None,
-        owner_reference: None,
+        owner_reference,
         references,
         id_from_enclosing_record: false,
         design_option: None,
+    })
+}
+
+/// Bytes from the ElementId to the marker of a record framed without an
+/// outline ([`scan_unoutlined_records`]).
+const ID_BEFORE_UNOUTLINED_MARKER: usize = 50;
+
+/// A 32-bit element record framed without an outline. Where an outlined
+/// record's marker holds the tag of `Outline`, this one holds `00 00`, two
+/// bytes nearer its ElementId (50 bytes on), and its two reference lists
+/// follow the marker with no box between. The ElementId, header tag,
+/// category, container, placement kind and class tag sit where an outlined
+/// record has them, relative to the ElementId.
+///
+/// The four samples probed (`rac_basic` 2016 and 2022, `rac_advanced` and
+/// `rst_basic` 2022) frame 6,670 to 8,441 records each this way, every one
+/// 50 bytes before its marker, and none of their ElementIds is also framed
+/// with an outline. Among them are sketch lines (41 of `rac_basic`'s, 465 of
+/// `rac_advanced`'s, 260 of `rst_basic`'s on 2022) whose 2024 copies are
+/// outlined, owner and all (`examples/probe_r6_no_outline.rs`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnoutlinedRecord {
+    /// Partition stream the record is in.
+    pub stream: String,
+    /// Offset of its ElementId in the stream's inflated bytes.
+    pub offset: usize,
+    /// Its ElementId.
+    pub element_id: u32,
+    /// Its `BuiltInCategory`.
+    pub builtin_category: i64,
+    /// Its container, `u64::MAX` for none, as an outlined record's.
+    pub container: u64,
+    /// Its placement kind, as an outlined record's.
+    pub placement_kind: u32,
+    /// Its class tag, as an outlined record's.
+    pub class_tag: u16,
+    /// Its first reference list.
+    pub references: Vec<u64>,
+    /// The last slot of its second reference list, as an outlined record's.
+    pub owner_reference: Option<u32>,
+}
+
+impl UnoutlinedRecord {
+    /// The record as an outlined record whose box is `bbox_feet`, which the
+    /// caller reads from elsewhere.
+    pub fn with_box(&self, bbox_feet: [f64; 6]) -> PartitionElementRecord {
+        PartitionElementRecord {
+            stream: self.stream.clone(),
+            offset: self.offset,
+            element_id: self.element_id,
+            flags: 0,
+            builtin_category: self.builtin_category,
+            container: self.container,
+            placement_kind: self.placement_kind,
+            class_tag: self.class_tag,
+            bbox_feet,
+            preceding_reference: None,
+            owner_reference: self.owner_reference,
+            references: self.references.clone(),
+            id_from_enclosing_record: false,
+            design_option: None,
+        }
+    }
+}
+
+/// Every 32-bit element record framed without an outline
+/// ([`UnoutlinedRecord`]) whose ElementId is declared in `Global/ElemTable`.
+/// Empty for any other release.
+pub fn scan_unoutlined_records(rf: &mut RevitFile, revit_version: u32) -> Vec<UnoutlinedRecord> {
+    if !reads_release(revit_version) {
+        return Vec::new();
+    }
+    let Ok(table) = crate::elem_table::parse_records(rf) else {
+        return Vec::new();
+    };
+    let declared = crate::elem_table::declared_ids(&table);
+    let Some((mut marker, header_tag)) = record_marker(rf) else {
+        return Vec::new();
+    };
+    marker[..2].copy_from_slice(&[0, 0]);
+    let mut out = Vec::new();
+    for stream in rf.partition_stream_names() {
+        let Ok(inflated) = rf.inflated_partition(&stream) else {
+            continue;
+        };
+        let buf = inflated.bytes();
+        for at in memchr::memmem::find_iter(buf, &marker) {
+            if let Some(record) = decode_unoutlined(&stream, buf, at, &declared, header_tag) {
+                out.push(record);
+            }
+        }
+    }
+    out
+}
+
+/// Decode the record framed without an outline whose marker is at `at`.
+fn decode_unoutlined(
+    stream: &str,
+    buf: &[u8],
+    at: usize,
+    declared: &BTreeSet<u32>,
+    header_tag: u16,
+) -> Option<UnoutlinedRecord> {
+    let id_at = at.checked_sub(ID_BEFORE_UNOUTLINED_MARKER)?;
+    let u32_at = |from: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            buf.get(from..from + 4)?.try_into().ok()?,
+        ))
+    };
+    let element_id = u32_at(id_at)?;
+    if !declared.contains(&element_id) {
+        return None;
+    }
+    let tag_at = id_at + HEADER_TAG_AFTER_ID;
+    if u16::from_le_bytes(buf.get(tag_at..tag_at + 2)?.try_into().ok()?) != header_tag {
+        return None;
+    }
+    // Relative to the ElementId, as on an outlined record.
+    let category_at = id_at + ID_BEFORE_MARKER - CATEGORY_BEFORE_MARKER;
+    let builtin_category =
+        i64::from_le_bytes(buf.get(category_at..category_at + 8)?.try_into().ok()?);
+    if !(BUILTIN_CATEGORY_MIN..=BUILTIN_CATEGORY_MAX).contains(&builtin_category) {
+        return None;
+    }
+    let container = match u32_at(id_at + ID_BEFORE_MARKER - CONTAINER_BEFORE_MARKER)? {
+        u32::MAX => u64::MAX,
+        id => u64::from(id),
+    };
+    let marker_at = id_at + ID_BEFORE_MARKER;
+    let base = marker_at as isize - BBOX_MARKER_OFFSET as isize;
+    let field = |offset: usize, len: usize| -> Option<&[u8]> {
+        let from = usize::try_from(base + offset as isize).ok()?;
+        buf.get(from..from + len)
+    };
+    let placement_kind = u32::from_le_bytes(field(PLACEMENT_KIND_OFFSET, 4)?.try_into().ok()?);
+    let class_tag = u16::from_le_bytes(field(CLASS_TAG_OFFSET, 2)?.try_into().ok()?);
+    let list_at = at + 8;
+    Some(UnoutlinedRecord {
+        stream: stream.to_string(),
+        offset: id_at,
+        element_id,
+        builtin_category,
+        container,
+        placement_kind,
+        class_tag,
+        references: u32_list(buf, list_at).unwrap_or_default(),
+        owner_reference: owner_after(buf, list_at),
     })
 }
 
@@ -189,6 +337,24 @@ fn decode_at_marker(
 /// `offset`): the `u32` list after the box, 52 + 8 + 48 bytes on.
 pub fn reference_list_at(buf: &[u8], id_at: usize) -> Option<Vec<u64>> {
     u32_list(buf, id_at.checked_add(ID_BEFORE_MARKER + 8 + 48)?)
+}
+
+/// The last slot of the second `u32` list, the one after the list at `at`:
+/// on a sketch line, the element whose sketch it is, as 2024's
+/// [`PartitionElementRecord::owner_reference`] (RE-25). Joined on ElementId
+/// with the 2024 copy of each Autodesk sample, it names 2024's owner on
+/// every shared outlined sketch line of the 13 files probed: `rac_basic`
+/// 2016, 2019 and 2022, and `rac_advanced` and `rst_basic` 2016, 2018, 2020,
+/// 2022 and 2023, 2,723 records (`examples/probe_r6_sketch_owner.rs`).
+/// `None` where either list does not decode or the second is empty or ends
+/// in 0.
+fn owner_after(buf: &[u8], at: usize) -> Option<u32> {
+    let first = u32_list(buf, at)?;
+    let second = u32_list(buf, at.checked_add(4 + 4 * first.len())?)?;
+    match *second.last()? {
+        0 => None,
+        id => u32::try_from(id).ok(),
+    }
 }
 
 fn u32_list(buf: &[u8], at: usize) -> Option<Vec<u64>> {

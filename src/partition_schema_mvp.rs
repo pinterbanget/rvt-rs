@@ -276,6 +276,11 @@ pub fn recover_partition_schema_mvp(
         );
         attach_curtain_axes(rf, revit_version, &mut out.products);
         attach_beam_sections(rf, revit_version, &mut out.products);
+        // --- Stair parts under their stairs (#323), and stairs' dimensions
+        // and runs' treads and risers from the native object graph (RE-47,
+        // RE-52) ---
+        attach_aggregate_wholes(rf, &mut out.products);
+        attach_native_stairs(rf, &mut out.products);
         return Ok(out);
     }
 
@@ -3493,6 +3498,17 @@ fn attach_wall_profile_openings(
         .filter(|record| wanted.contains(&record.element_id))
         .map(|record| (record.element_id, record.bbox_feet))
         .collect();
+    push_wall_profile_openings(walls, &lists, &curves, &boxes);
+}
+
+/// [`attach_wall_profile_openings`] given each wall's sketch list (`lists`),
+/// and each listed sketch line's curve and box.
+fn push_wall_profile_openings(
+    walls: &mut [DecodedElement],
+    lists: &BTreeMap<u32, Vec<u32>>,
+    curves: &BTreeMap<u32, crate::partition_beam_axes::SketchCurve>,
+    boxes: &BTreeMap<u32, [f64; 6]>,
+) {
     let in_box = |point: [f64; 3], bbox: &[f64; 6]| {
         (0..3).all(|axis| {
             point[axis] >= bbox[axis] - PROFILE_EPS_FEET
@@ -4263,28 +4279,315 @@ fn attach_stair_run_bodies(
         else {
             continue;
         };
-        let scalar = |value: f64| InstanceField::Float { value, size: 8 };
-        for (name, value) in STAIR_RUN_ORIGIN_FIELDS.iter().zip(sketch.origin) {
-            element.fields.push(((*name).into(), scalar(value)));
-        }
-        for (name, value) in STAIR_RUN_CLIMB_FIELDS.iter().zip(sketch.climb) {
-            element.fields.push(((*name).into(), scalar(value)));
-        }
-        for (name, value) in STAIR_RUN_ACROSS_FIELDS.iter().zip(sketch.across) {
-            element.fields.push(((*name).into(), scalar(value)));
-        }
-        element
-            .fields
-            .push((STAIR_RUN_WIDTH_FIELD.into(), scalar(sketch.width_feet)));
-        element.fields.push((
-            STAIR_RUN_PROFILE_FIELD.into(),
-            InstanceField::Vector(
-                profile
+        push_stair_run_body(element, sketch, &profile);
+    }
+}
+
+/// Give a stair run its body (RE-52): its sketch's origin, climb and across
+/// directions and width, and its side profile
+/// ([`crate::partition_stairs::run_side_profile`]).
+fn push_stair_run_body(
+    element: &mut DecodedElement,
+    sketch: &crate::partition_stairs::RunSketch,
+    profile: &[[f64; 2]],
+) {
+    let scalar = |value: f64| InstanceField::Float { value, size: 8 };
+    for (name, value) in STAIR_RUN_ORIGIN_FIELDS.iter().zip(sketch.origin) {
+        element.fields.push(((*name).into(), scalar(value)));
+    }
+    for (name, value) in STAIR_RUN_CLIMB_FIELDS.iter().zip(sketch.climb) {
+        element.fields.push(((*name).into(), scalar(value)));
+    }
+    for (name, value) in STAIR_RUN_ACROSS_FIELDS.iter().zip(sketch.across) {
+        element.fields.push(((*name).into(), scalar(value)));
+    }
+    element
+        .fields
+        .push((STAIR_RUN_WIDTH_FIELD.into(), scalar(sketch.width_feet)));
+    element.fields.push((
+        STAIR_RUN_PROFILE_FIELD.into(),
+        InstanceField::Vector(
+            profile
+                .iter()
+                .map(|&[u, z]| InstanceField::Vector(vec![scalar(u), scalar(z)]))
+                .collect(),
+        ),
+    ));
+}
+
+/// Stairs and stair runs of a 32-bit release, from the native object graph
+/// (`native_document`, schema-driven on every release): RE-47's dimensions
+/// and RE-52's run bodies, which 2024 reads at fixed offsets of the stair's,
+/// run's and run type's data.
+/// - A stair's `StairsElement` holds its riser height
+///   (`m_actualRiserHeight`), tread depth (`m_actualTreadDepth`) and number
+///   of risers (`m_actualNumberOfRisers`).
+/// - A run's `StairsRun` names its stair (`m_stairsId`), and holds its first
+///   and last riser index, whether it ends with a riser (`m_endWithRiser`,
+///   RE-92), and its boundary and riser lines as `GLine` objects in the order
+///   2024's data holds them ([`crate::partition_stairs::run_sketch`]). Its
+///   number of risers is its stair's where it is the stair's only run, and
+///   otherwise the difference of its riser indices where the stair's runs'
+///   add up to the stair's (RE-47's rule).
+/// - A run's type is the one `StairsRunType` its record's reference list
+///   names, as on 2024, read field by field
+///   ([`crate::partition_stairs::RunType`]).
+///
+/// On the 2024 copies of Autodesk's three samples and Snowdon Towers, the
+/// native fields of all 20 run types equal what RE-52 reads from their bytes
+/// (`examples/probe_r6_run_types.rs`), `m_riserTreadConnection` 1 being a
+/// tread run on under the riser. On `rac_advanced` 2022, the five runs 2024
+/// draws have the riser count (13) and stair 2024 reads.
+fn attach_native_stairs(rf: &mut RevitFile, products: &mut [DecodedElement]) {
+    use crate::partition_beam_axes::BoundedLine;
+    use crate::partition_stairs as ps;
+    let id_of = |value: &serde_json::Value| {
+        crate::native_metadata::identifier(value)
+            .ok()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|&id| id > 0)
+    };
+    let run_ids: BTreeSet<u64> = products
+        .iter()
+        .filter(|element| element.class == "StairsRun")
+        .filter_map(|element| element.id.map(u64::from))
+        .collect();
+    let stair_ids: BTreeSet<u64> = products
+        .iter()
+        .filter(|element| element.class == "Stair")
+        .filter_map(|element| element.id.map(u64::from))
+        .collect();
+    if run_ids.is_empty() && stair_ids.is_empty() {
+        return;
+    }
+    // Each run's type candidates: the ids its record's reference list names.
+    let mut candidates: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for element in products
+        .iter()
+        .filter(|element| element.class == "StairsRun")
+    {
+        if let (Some(id), Some((references, _))) = (element.id, record_references(rf, element)) {
+            candidates.insert(
+                id,
+                references
                     .iter()
-                    .map(|&[u, z]| InstanceField::Vector(vec![scalar(u), scalar(z)]))
+                    .filter_map(|&reference| u32::try_from(reference).ok())
+                    .filter(|&reference| reference != id)
                     .collect(),
-            ),
-        ));
+            );
+        }
+    }
+    let mut wanted = run_ids.clone();
+    wanted.extend(stair_ids.iter().copied());
+    wanted.extend(candidates.values().flatten().map(|&id| u64::from(id)));
+    let graphs = native_graphs(rf, wanted);
+    let root = |id: u32, class: &str| {
+        graphs
+            .get(&id)
+            .and_then(|graph| graph.objects.first())
+            .filter(|object| object.class_name == class)
+    };
+    let float = |object: &crate::native_parameters::GraphObject, name: &str| {
+        object.fields.get(name).and_then(|value| value.as_f64())
+    };
+    let int = |object: &crate::native_parameters::GraphObject, name: &str| {
+        object.fields.get(name).and_then(|value| value.as_i64())
+    };
+    let boolean = |object: &crate::native_parameters::GraphObject, name: &str| {
+        object.fields.get(name).and_then(|value| value.as_bool())
+    };
+    let dimensions = |stair: u32| -> Option<ps::StairDimensions> {
+        let object = root(stair, "StairsElement")?;
+        Some(ps::StairDimensions {
+            riser_height_feet: float(object, "m_actualRiserHeight")
+                .filter(|v| v.is_finite() && *v > 0.0 && *v < 2.0)?,
+            tread_depth_feet: float(object, "m_actualTreadDepth")
+                .filter(|v| v.is_finite() && *v > 0.0 && *v < 10.0)?,
+            riser_count: u32::try_from(int(object, "m_actualNumberOfRisers")?)
+                .ok()
+                .filter(|count| (1..=ps::MAX_RISERS).contains(count))?,
+        })
+    };
+    let run_type = |id: u32| -> Option<ps::RunType> {
+        let graph = graphs.get(&id)?;
+        let object = graph
+            .objects
+            .first()
+            .filter(|o| o.class_name == "StairsRunType")?;
+        let length = |name: &str, limit: f64| {
+            float(object, name).filter(|v| v.is_finite() && (0.0..limit).contains(v))
+        };
+        Some(ps::RunType {
+            structural_depth_feet: length("m_structuralDepth", 10.0)?,
+            tread_thickness_feet: length("m_treadThickness", 2.0)?,
+            riser_thickness_feet: length("m_riserThickness", 2.0)?,
+            nosing_length_feet: length("m_nosingLength", 2.0)?,
+            monolithic: boolean(object, "m_hasMonolithicSupport")?,
+            treads: boolean(object, "m_hasTread")?,
+            risers: boolean(object, "m_hasRiser")?,
+            slanted_risers: boolean(object, "m_riserIsSlanted")?,
+            tread_under_riser: match int(object, "m_riserTreadConnection")? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            name: graph
+                .objects
+                .iter()
+                .find(|o| o.class_name == "SymbolInfo")
+                .and_then(|o| o.fields.get("m_name"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+        })
+    };
+    let lines = |id: u32| -> Vec<BoundedLine> {
+        let triple = |value: Option<&serde_json::Value>| -> Option<[f64; 3]> {
+            let items = value?.as_array()?;
+            Some([
+                items.first()?.as_f64()?,
+                items.get(1)?.as_f64()?,
+                items.get(2)?.as_f64()?,
+            ])
+        };
+        graphs
+            .get(&id)
+            .map(|graph| {
+                graph
+                    .objects
+                    .iter()
+                    .filter(|object| object.class_name == "GLine")
+                    .filter_map(|object| {
+                        let params = object.fields.get("m_endParams")?.as_array()?;
+                        Some(BoundedLine {
+                            start_parameter: params.first()?.as_f64()?,
+                            end_parameter: params.get(1)?.as_f64()?,
+                            origin: triple(object.fields.get("m_origin"))?,
+                            direction: triple(object.fields.get("m_dirVec"))?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let push_dimensions =
+        |element: &mut DecodedElement, found: &ps::StairDimensions, risers: Option<u32>| {
+            if let Some(risers) = risers {
+                element.fields.push((
+                    STAIR_RISER_COUNT_FIELD.into(),
+                    InstanceField::Integer {
+                        value: i64::from(risers),
+                        signed: false,
+                        size: 4,
+                    },
+                ));
+            }
+            element.fields.push((
+                STAIR_RISER_HEIGHT_FIELD.into(),
+                InstanceField::Float {
+                    value: found.riser_height_feet,
+                    size: 8,
+                },
+            ));
+            element.fields.push((
+                STAIR_TREAD_DEPTH_FIELD.into(),
+                InstanceField::Float {
+                    value: found.tread_depth_feet,
+                    size: 8,
+                },
+            ));
+        };
+    // Each run's number of risers by RE-47's rule
+    // ([`crate::partition_stairs::flight_riser_counts`]): a stair's only run
+    // has the stair's, and several runs have the differences of their riser
+    // indices where those add up to the stair's.
+    let stair_of =
+        |run: &crate::native_parameters::GraphObject| run.fields.get("m_stairsId").and_then(id_of);
+    let mut runs_of: BTreeMap<u32, Vec<(u32, Option<u32>)>> = BTreeMap::new();
+    for run_id in run_ids.iter().filter_map(|&id| u32::try_from(id).ok()) {
+        let Some(run) = root(run_id, "StairsRun") else {
+            continue;
+        };
+        let Some(stair) = stair_of(run) else {
+            continue;
+        };
+        let own = int(run, "m_topRiserIndex")
+            .zip(int(run, "m_baseRiserIndex"))
+            .and_then(|(top, base)| u32::try_from(top - base).ok());
+        runs_of.entry(stair).or_default().push((run_id, own));
+    }
+    let mut run_risers: BTreeMap<u32, u32> = BTreeMap::new();
+    for (stair, runs) in &runs_of {
+        if let Some(found) = dimensions(*stair) {
+            run_risers.extend(ps::flight_riser_counts(found.riser_count, runs));
+        }
+    }
+    for element in products.iter_mut() {
+        let Some(id) = element.id else {
+            continue;
+        };
+        if element.class == "Stair" {
+            if let Some(found) = dimensions(id) {
+                push_dimensions(element, &found, Some(found.riser_count));
+            }
+            continue;
+        }
+        if element.class != "StairsRun" {
+            continue;
+        }
+        let Some(run) = root(id, "StairsRun") else {
+            continue;
+        };
+        let Some(found) = stair_of(run).and_then(dimensions) else {
+            continue;
+        };
+        let risers = run_risers.get(&id).copied();
+        push_dimensions(element, &found, risers);
+        let types: Vec<u32> = candidates
+            .get(&id)
+            .map(|ids| {
+                ids.iter()
+                    .copied()
+                    .filter(|&c| root(c, "StairsRunType").is_some())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ([type_id], Some(risers)) = (types.as_slice(), risers) else {
+            continue;
+        };
+        let Some(run_type) = run_type(*type_id) else {
+            continue;
+        };
+        if let (Some(name), false) = (
+            &run_type.name,
+            element
+                .fields
+                .iter()
+                .any(|(name, _)| name == TYPE_NAME_FIELD),
+        ) {
+            element.fields.push((
+                TYPE_ID_FIELD.into(),
+                InstanceField::ElementId {
+                    tag: 0,
+                    id: *type_id,
+                },
+            ));
+            element
+                .fields
+                .push((TYPE_NAME_FIELD.into(), InstanceField::String(name.clone())));
+        }
+        let end_with_riser = boolean(run, "m_endWithRiser");
+        let riser_lines = i64::from(risers) + i64::from(end_with_riser == Some(false));
+        let Some(sketch) = ps::run_sketch(&lines(id))
+            .filter(|sketch| i64::try_from(sketch.risers.len()) == Ok(riser_lines))
+        else {
+            continue;
+        };
+        let Some(profile) =
+            ps::run_side_profile(&sketch, &run_type, found.riser_height_feet, end_with_riser)
+        else {
+            continue;
+        };
+        push_stair_run_body(element, &sketch, &profile);
     }
 }
 
@@ -5881,6 +6184,27 @@ fn recover_2023_records(rf: &mut RevitFile, revit_version: u32, out: &mut Partit
     let records = crate::partition_element_records_2023::scan_records(rf, revit_version);
     let names = type_and_family_names_2023(rf, &records);
     let system_types = system_type_names_2023(rf, revit_version, &records);
+    // Sketch lines, outlined or not, with their curves and their sketches'
+    // lists from the native object graph.
+    let unoutlined: Vec<crate::partition_element_records_2023::UnoutlinedRecord> =
+        crate::partition_element_records_2023::scan_unoutlined_records(rf, revit_version)
+            .into_iter()
+            .filter(|record| record.builtin_category == per::OST_SKETCH_LINES)
+            .collect();
+    let outlined: Vec<per::PartitionElementRecord> = records
+        .iter()
+        .filter(|record| record.builtin_category == per::OST_SKETCH_LINES)
+        .cloned()
+        .collect();
+    let sketches = native_sketches(
+        rf,
+        &outlined
+            .iter()
+            .map(|record| record.element_id)
+            .chain(unoutlined.iter().map(|record| record.element_id))
+            .collect(),
+    );
+    let sketch_lines = sketch_lines_32bit(outlined, &unoutlined, &sketches.curves);
     let selected = select_newest_instance_records(records);
     // Only a family instance can be nested; a host wall and the doors it
     // hosts name each other too (RE-76's class tag, at the same place on
@@ -5949,6 +6273,29 @@ fn recover_2023_records(rf: &mut RevitFile, revit_version: u32, out: &mut Partit
             _ => out.products.push(decoded),
         }
     }
+    // --- Floors', roofs' and ceilings' outlines from their sketch lines, by
+    // 2024's solver (RE-25, RE-50, RE-98) ---
+    attach_sketch_outlines(
+        rf,
+        revit_version,
+        &sketch_lines,
+        &sketches,
+        [&mut out.slabs, &mut out.products],
+    );
+    // --- Openings walls' edited elevation profiles cut (B55), from their
+    // sketches' lists and lines as above ---
+    let wall_ids: BTreeSet<u32> = out.walls.iter().filter_map(|wall| wall.id).collect();
+    let wall_lists: BTreeMap<u32, Vec<u32>> = sketches
+        .lists
+        .iter()
+        .filter(|(owner, _)| wall_ids.contains(owner))
+        .map(|(owner, lines)| (*owner, lines.clone()))
+        .collect();
+    let line_boxes: BTreeMap<u32, [f64; 6]> = sketch_lines
+        .iter()
+        .map(|record| (record.element_id, record.bbox_feet))
+        .collect();
+    push_wall_profile_openings(&mut out.walls, &wall_lists, &sketches.curves, &line_boxes);
     // --- Walls cut back by the walls they join, by 2024's solver (RE-26,
     // RE-29): a 2023 record box is the untrimmed wall too, and its
     // reference list names the walls it joins (RE-120) ---
@@ -6263,6 +6610,169 @@ fn native_graphs(
         Ok(())
     });
     out
+}
+
+/// The curves and sketch lists of a 32-bit release's sketch lines, from the
+/// native object graph ([`native_sketches`]).
+#[derive(Debug, Clone, Default)]
+pub struct NativeSketches {
+    /// Each sketch line's curve: its one `GLine`, or its one `GArc`.
+    pub curves: BTreeMap<u32, crate::partition_beam_axes::SketchCurve>,
+    /// The sketch lines of each sketched element, by its sketch's list.
+    pub lists: BTreeMap<u32, Vec<u32>>,
+}
+
+/// The curves and sketch lists of the sketch lines `sketch_lines` of a
+/// 32-bit release, from the native object graph (`native_document`, which
+/// reads each element's copy the element table names; a byte scan meets
+/// every copy of an element's data and drops one whose copies disagree, as
+/// sketch line 147478 of `rac_advanced` 2021, stored in two partitions).
+///
+/// - **Curves.** A sketch line's `CurveElem` holds its curve as one `GLine`
+///   (`m_origin`, `m_dirVec`, `m_endParams`) or one `GArc` (`m_center`,
+///   `m_radius`, `m_xVec`, `m_yVec`, `m_endParams` in radians), what
+///   [`crate::partition_beam_axes::scan_sketch_curves`] reads from a 2024
+///   sketch line's data (RE-50, RE-96). A line with neither, or more than
+///   one, has no curve.
+/// - **Lists.** RE-97 reads a sketched element's lines from its 2024 Sketch's
+///   data ([`crate::element_record_plan_profiles::scan_sketch_curve_lists`]).
+///   Here each sketch line's `SketchMembership.m_groupId` names its sketch (a
+///   `VarSketch` on Autodesk's samples), whose `m_userId` names the sketched
+///   element and whose `m_curveObjIdxMap` pairs each of its curves with an
+///   index. Read by RE-97's rules: a list of at least
+///   [`crate::element_record_plan_profiles::SKETCH_MIN_CURVES`] curves, all
+///   of them in `sketch_lines`, for an element that is not itself a sketch
+///   line; an element two sketches list differently, or a line two lists
+///   hold, is dropped.
+pub fn native_sketches(rf: &mut RevitFile, sketch_lines: &BTreeSet<u32>) -> NativeSketches {
+    use crate::element_record_plan_profiles::{SKETCH_MAX_CURVES, SKETCH_MIN_CURVES};
+    use crate::partition_beam_axes::{BoundedArc, BoundedLine, SketchCurve};
+    let id = |value: &serde_json::Value| {
+        crate::native_metadata::identifier(value)
+            .ok()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|&id| id > 0)
+    };
+    let triple = |value: Option<&serde_json::Value>| -> Option<[f64; 3]> {
+        let items = value?.as_array()?;
+        Some([
+            items.first()?.as_f64()?,
+            items.get(1)?.as_f64()?,
+            items.get(2)?.as_f64()?,
+        ])
+    };
+    let pair = |value: Option<&serde_json::Value>| -> Option<(f64, f64)> {
+        let items = value?.as_array()?;
+        Some((items.first()?.as_f64()?, items.get(1)?.as_f64()?))
+    };
+    let line_graphs = native_graphs(rf, sketch_lines.iter().map(|&id| u64::from(id)).collect());
+    let mut curves = BTreeMap::new();
+    for (&line, graph) in &line_graphs {
+        let objects: Vec<&crate::native_parameters::GraphObject> = graph
+            .objects
+            .iter()
+            .filter(|object| object.class_name == "GLine" || object.class_name == "GArc")
+            .collect();
+        let [object] = objects.as_slice() else {
+            continue;
+        };
+        let fields = &object.fields;
+        let curve = if object.class_name == "GLine" {
+            (|| {
+                let (start_parameter, end_parameter) = pair(fields.get("m_endParams"))?;
+                Some(SketchCurve {
+                    line: Some(BoundedLine {
+                        start_parameter,
+                        end_parameter,
+                        origin: triple(fields.get("m_origin"))?,
+                        direction: triple(fields.get("m_dirVec"))?,
+                    }),
+                    arc: None,
+                })
+            })()
+        } else {
+            (|| {
+                let (start_angle, end_angle) = pair(fields.get("m_endParams"))?;
+                Some(SketchCurve {
+                    line: None,
+                    arc: Some(BoundedArc {
+                        start_angle,
+                        end_angle,
+                        x_axis: triple(fields.get("m_xVec"))?,
+                        y_axis: triple(fields.get("m_yVec"))?,
+                        radius: fields.get("m_radius")?.as_f64()?,
+                        centre: triple(fields.get("m_center"))?,
+                    }),
+                })
+            })()
+        };
+        if let Some(curve) = curve {
+            curves.insert(line, curve);
+        }
+    }
+    let sketches: BTreeSet<u64> = line_graphs
+        .values()
+        .filter_map(|graph| {
+            graph
+                .objects
+                .iter()
+                .find(|object| object.class_name == "SketchMembership")?
+                .fields
+                .get("m_groupId")
+                .and_then(id)
+        })
+        .map(u64::from)
+        .collect();
+    let mut found: BTreeMap<u32, Option<Vec<u32>>> = BTreeMap::new();
+    for graph in native_graphs(rf, sketches).values() {
+        let Some(root) = graph.objects.first() else {
+            continue;
+        };
+        let (Some(owner), Some(map)) = (
+            root.fields.get("m_userId").and_then(id),
+            root.fields
+                .get("m_curveObjIdxMap")
+                .and_then(|value| value.as_array()),
+        ) else {
+            continue;
+        };
+        let listed: Option<Vec<u32>> = map
+            .iter()
+            .map(|entry| id(entry.get("first")?).filter(|curve| sketch_lines.contains(curve)))
+            .collect();
+        let Some(listed) = listed.filter(|listed| {
+            (SKETCH_MIN_CURVES..=SKETCH_MAX_CURVES).contains(&listed.len())
+                && !sketch_lines.contains(&owner)
+        }) else {
+            continue;
+        };
+        match found.get(&owner) {
+            None => {
+                found.insert(owner, Some(listed));
+            }
+            Some(held) if held.as_ref() != Some(&listed) => {
+                found.insert(owner, None);
+            }
+            _ => {}
+        }
+    }
+    let lists: BTreeMap<u32, Vec<u32>> = found
+        .into_iter()
+        .filter_map(|(owner, listed)| Some((owner, listed?)))
+        .collect();
+    let mut listed: BTreeMap<u32, usize> = BTreeMap::new();
+    for ids in lists.values() {
+        for curve in ids {
+            *listed.entry(*curve).or_default() += 1;
+        }
+    }
+    NativeSketches {
+        curves,
+        lists: lists
+            .into_iter()
+            .filter(|(_, ids)| ids.iter().all(|curve| listed[curve] == 1))
+            .collect(),
+    }
 }
 
 /// Give each element of `groups` that has a type and no material yet its
@@ -6663,7 +7173,7 @@ pub fn slabs_from_partition_category_records(
             .entry(record.element_id)
             .or_insert([b[0], b[1], b[3], b[4]]);
     }
-    let profiles = sketch_plan_profiles(rf, revit_version, &sketch_lines, &plates);
+    let profiles = sketch_plan_profiles(rf, revit_version, &sketch_lines, &plates, None);
 
     let mut out = Vec::new();
     for (category, class) in [
@@ -6696,7 +7206,9 @@ pub const SKETCH_BOX_TOLERANCE_FEET: f64 = 1e-3;
 /// where it has one (RE-97) or else the lines naming them, and their
 /// `OST_SketchLines` records: the RE-25 solve over the records' boxes and,
 /// where that does not close, the exact ends each sketch line's own data
-/// carries (RE-50, [`crate::partition_beam_axes::scan_bounded_lines`]). A
+/// carries (RE-50, [`crate::partition_beam_axes::scan_bounded_lines`]), or,
+/// on a 32-bit release, the lists and curves of `native`
+/// ([`native_sketches`]). A
 /// line counts only when it is level and both its ends lie in its own
 /// record's box; an element any of whose lines does not count keeps no
 /// profile, except that a zero-length line on one of the others' ends is
@@ -6711,6 +7223,7 @@ fn sketch_plan_profiles(
     revit_version: u32,
     sketch_lines: &[crate::partition_element_records::PartitionElementRecord],
     owners: &std::collections::BTreeMap<u32, [f64; 4]>,
+    native: Option<&NativeSketches>,
 ) -> std::collections::BTreeMap<u32, crate::element_record_plan_profiles::PlanProfile> {
     use crate::element_record_plan_profiles as erpp;
     use std::collections::BTreeMap;
@@ -6718,11 +7231,13 @@ fn sketch_plan_profiles(
     // sketch's membership; a line's own owner reference names another
     // element where the sketch was edited.
     let line_ids: BTreeSet<u32> = sketch_lines.iter().map(|r| r.element_id).collect();
-    let lists: BTreeMap<u32, Vec<u32>> =
-        erpp::scan_sketch_curve_lists(rf, revit_version, &line_ids)
-            .into_iter()
-            .filter(|(owner, _)| owners.contains_key(owner))
-            .collect();
+    let lists: BTreeMap<u32, Vec<u32>> = match native {
+        Some(native) => native.lists.clone(),
+        None => erpp::scan_sketch_curve_lists(rf, revit_version, &line_ids),
+    }
+    .into_iter()
+    .filter(|(owner, _)| owners.contains_key(owner))
+    .collect();
     let listed: BTreeMap<u32, u32> = lists
         .iter()
         .flat_map(|(owner, curves)| curves.iter().map(move |id| (*id, *owner)))
@@ -6790,11 +7305,29 @@ fn sketch_plan_profiles(
         .values()
         .flat_map(|lines| lines.keys().copied())
         .collect();
-    let (Ok(lines), Ok(curves)) = (
-        crate::partition_beam_axes::scan_bounded_lines(rf, revit_version, &ids),
-        crate::partition_beam_axes::scan_sketch_curves(rf, revit_version, &ids),
-    ) else {
-        return profiles;
+    let (lines, curves) = match native {
+        Some(native) => {
+            let curves: BTreeMap<u32, crate::partition_beam_axes::SketchCurve> = native
+                .curves
+                .iter()
+                .filter(|(id, _)| ids.contains(id))
+                .map(|(id, curve)| (*id, *curve))
+                .collect();
+            let lines = curves
+                .iter()
+                .filter_map(|(id, curve)| Some((*id, curve.line?)))
+                .collect();
+            (lines, curves)
+        }
+        None => {
+            let (Ok(lines), Ok(curves)) = (
+                crate::partition_beam_axes::scan_bounded_lines(rf, revit_version, &ids),
+                crate::partition_beam_axes::scan_sketch_curves(rf, revit_version, &ids),
+            ) else {
+                return profiles;
+            };
+            (lines, curves)
+        }
     };
     let arcs: BTreeMap<u32, crate::partition_beam_axes::BoundedArc> = curves
         .iter()
@@ -6937,13 +7470,135 @@ fn attach_roof_profiles(rf: &mut RevitFile, revit_version: u32, products: &mut [
     else {
         return;
     };
-    let profiles = sketch_plan_profiles(rf, revit_version, &sketch_lines, &roofs);
+    let profiles = sketch_plan_profiles(rf, revit_version, &sketch_lines, &roofs, None);
     for roof in products
         .iter_mut()
         .filter(|element| SKETCHED_PRODUCT_CLASSES.contains(&element.class.as_str()))
     {
         if let Some(profile) = roof.id.and_then(|id| profiles.get(&id)) {
             roof.fields.extend(profile.fields());
+        }
+    }
+}
+
+/// The sketch lines of a 32-bit release, `outlined` (its outlined records')
+/// and `unoutlined` (those framed without an outline,
+/// [`crate::partition_element_records_2023::UnoutlinedRecord`]), each boxed
+/// by its own curve in `curves` ([`native_sketches`]) where it has one: a
+/// line's ends, or an arc drawn as chords
+/// ([`crate::element_record_plan_profiles::arc_points`]).
+///
+/// A 32-bit sketch line's record box can be stale where its curve is not.
+/// On `rst_basic` 2022 floor 647908's bottom edge lies 0.26 mm off its box,
+/// and on `rac_basic` 2022 roof 724430's lines lie 4.6 ft above theirs; their
+/// curves are their 2024 copies', and so are the 2024 copies' boxes. An
+/// outlined line without a curve keeps its record box; a line framed without
+/// an outline and without a curve is left out.
+pub fn sketch_lines_32bit(
+    outlined: Vec<crate::partition_element_records::PartitionElementRecord>,
+    unoutlined: &[crate::partition_element_records_2023::UnoutlinedRecord],
+    curves: &BTreeMap<u32, crate::partition_beam_axes::SketchCurve>,
+) -> Vec<crate::partition_element_records::PartitionElementRecord> {
+    let curve_box = |id: u32| -> Option<[f64; 6]> {
+        let points = match curves.get(&id)? {
+            crate::partition_beam_axes::SketchCurve {
+                line: Some(line),
+                arc: None,
+            } => vec![line.start(), line.end()],
+            crate::partition_beam_axes::SketchCurve {
+                line: None,
+                arc: Some(arc),
+            } => crate::element_record_plan_profiles::arc_points(arc)?,
+            _ => return None,
+        };
+        let mut bbox = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            -f64::INFINITY,
+            -f64::INFINITY,
+            -f64::INFINITY,
+        ];
+        for point in &points {
+            for axis in 0..3 {
+                bbox[axis] = bbox[axis].min(point[axis]);
+                bbox[axis + 3] = bbox[axis + 3].max(point[axis]);
+            }
+        }
+        bbox.iter().all(|v| v.is_finite()).then_some(bbox)
+    };
+    let mut out: Vec<crate::partition_element_records::PartitionElementRecord> = outlined
+        .into_iter()
+        .map(|mut record| {
+            if let Some(bbox) = curve_box(record.element_id) {
+                record.bbox_feet = bbox;
+            }
+            record
+        })
+        .collect();
+    out.extend(
+        unoutlined
+            .iter()
+            .filter_map(|record| Some(record.with_box(curve_box(record.element_id)?))),
+    );
+    out
+}
+
+/// Classes a 32-bit record names whose plan outline is their sketch's:
+/// floors and building pads (RE-25) and [`SKETCHED_PRODUCT_CLASSES`].
+pub const SKETCHED_32BIT_CLASSES: &[&str] = &["Floor", "BuildingPad", "Roof", "Ceiling"];
+
+/// Give each floor, building pad, roof and ceiling of a 32-bit release the
+/// plan outline its sketch lines close, as 2024's are given theirs
+/// ([`slabs_from_partition_category_records`], [`attach_roof_profiles`]).
+/// A 32-bit sketch line names its element in the same slot as 2024's
+/// ([`crate::partition_element_records_2023`]); each element's plan box is
+/// its record box.
+fn attach_sketch_outlines(
+    rf: &mut RevitFile,
+    revit_version: u32,
+    sketch_lines: &[crate::partition_element_records::PartitionElementRecord],
+    sketches: &NativeSketches,
+    groups: [&mut Vec<DecodedElement>; 2],
+) {
+    let float = |element: &DecodedElement, wanted: &str| {
+        element.fields.iter().find_map(|(name, value)| match value {
+            InstanceField::Float { value, .. } if name == wanted => Some(*value),
+            _ => None,
+        })
+    };
+    let sketched =
+        |element: &DecodedElement| SKETCHED_32BIT_CLASSES.contains(&element.class.as_str());
+    let owners: std::collections::BTreeMap<u32, [f64; 4]> = groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|element| sketched(element))
+        .filter_map(|element| {
+            let (x, y) = (
+                float(element, "m_locationX")?,
+                float(element, "m_locationY")?,
+            );
+            let (w, d) = (
+                float(element, "m_bboxWidth")?,
+                float(element, "m_bboxDepth")?,
+            );
+            Some((
+                element.id?,
+                [x - w / 2.0, y - d / 2.0, x + w / 2.0, y + d / 2.0],
+            ))
+        })
+        .collect();
+    if owners.is_empty() || sketch_lines.is_empty() {
+        return;
+    }
+    let profiles = sketch_plan_profiles(rf, revit_version, sketch_lines, &owners, Some(sketches));
+    for element in groups
+        .into_iter()
+        .flat_map(|group| group.iter_mut())
+        .filter(|element| sketched(element))
+    {
+        if let Some(profile) = element.id.and_then(|id| profiles.get(&id)) {
+            element.fields.extend(profile.fields());
         }
     }
 }
