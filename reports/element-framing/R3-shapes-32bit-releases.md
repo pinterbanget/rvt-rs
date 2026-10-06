@@ -1,7 +1,7 @@
 # R3: shapes for Revit 2016 to 2022
 
 **Date:** 2026-10-06
-**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`
+**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`, `f4175e3`
 **Status:** positive. On 2016 to 2022, the 32-bit route now draws real shapes from three decoders the 2024 route already had. The share of real shapes is level with the 2024 copy, except for column I-sections.
 **Answer key:** as in R1. Autodesk's three sample projects of each release are joined on ElementId with the 2024 copy's export. Scored with `tools/re/cross_release_vs_reference.py`, which now also reports box agreement where both exports draw an element the same way ("same-body").
 **Probes:**
@@ -35,18 +35,28 @@
    - Its 17 I-section columns are drawn on 2017 to 2022.
    - Revit 2016 writes none of the structural section BuiltInParameters; they first appear in 2017. So 2016's columns keep their box.
 
+6. **Every wall as 2024 draws it** (`f4175e3`).
+   - **Join lists.** On a 32-bit release a wall's join lists put a `u32` and 13 zero bytes before the count (at +29 from the opening word), and hold `u32 · u32 ElementId · u32` entries. Wall 198694 of `rac_basic` 2016 and 2022 holds the same lists as its 2024 copy. Read with the 32-bit header, butt joins (RE-70, RE-127) resolve.
+   - **Wall types.** A 32-bit wall's type is no longer picked from among the Levels and materials its record names. Level 1, which no window names, kept two walls from their type, and a cladding material that only walls name took a third's.
+   - **Curtain walls.** `record_references` reads a 32-bit record's `u32` list, and the 32-bit route attaches curtain walls (RE-46).
+   - **Result.** On 2016 and 2022 every wall and curtain wall that both exports hold agrees with 2024 in class, body source and box: 47 of 47 on `rac_basic`, 146 of 146 on `rac_advanced`.
+
 ## Default export against the 2024 copy
 
 "Real shape" counts a body that is not the record's box, cut or trimmed: walls along their centreline, beams along their axis, saved meshes. Record boxes trimmed at joins or cut at columns count as boxes.
 
-| model | releases | real shape (test / 2024) | box | same-body box |
-|---|---|---|---|---|
-| rac_basic | 2016 to 2017 | 3.9 / 5.4 % | 97.6 to 97.8 % | 98.9 to 99.1 % of 445 |
-| rac_basic | 2018 to 2023 | 3.9 / 5.4 % | 98.2 % | 99.6 % of 445 |
-| rst_basic | 2016 | 76.6 / 80.6 % | 96.5 % | 97.0 % of 428 |
-| rst_basic | 2017 to 2023 | 80.2 to 80.4 / 80.4 to 80.6 % | 99.3 % | 100 % of 445 to 446 |
-| rac_advanced | 2016 to 2020 | 2.2 / 2.6 % | 96.5 % | 97.0 % of 5,521 |
-| rac_advanced | 2021 to 2023 | 1.9 to 2.2 / 2.7 % | 99.1 to 99.4 % | 99.9 % of 5,565 to 5,580 |
+As of `f4175e3`:
+
+| model | releases | class | real shape (test / 2024) | box | same-body box |
+|---|---|---|---|---|---|
+| rac_basic | 2016 to 2017 | 100 % | 5.4 / 5.4 % | 99.3 to 99.6 % | 99.3 to 99.6 % of 452 |
+| rac_basic | 2018 to 2023 | 100 % | 5.4 / 5.4 % | 100 % | 100 % of 452 |
+| rst_basic | 2016 | 100 % | 76.6 / 80.6 % | 96.5 % | 97.0 % of 428 |
+| rst_basic | 2017 to 2023 | 100 % | 80.2 to 80.4 / 80.4 to 80.6 % | 99.3 % | 100 % of 445 to 446 |
+| rac_advanced | 2016 to 2020 | 100 % | 2.6 / 2.6 % | 97.1 % | 97.1 % of 5,554 |
+| rac_advanced | 2021 to 2023 | 100 % | 2.3 to 2.6 / 2.7 % | 99.6 to 99.9 % | 99.9 to 100 % of 5,598 to 5,613 |
+
+Storeys agree on 99.4 to 100 % (`rst_basic` 2016: 95.4 %).
 
 Before R3, real shapes were 0 % on every 32-bit release, and box agreement 93.6 to 97.9 %.
 
@@ -56,10 +66,19 @@ Exports of 2024 files are byte-identical apart from timestamps, with or without 
 
 ## With `--saved-meshes`
 
-*(To be filled from `rvt-corpus/out-r3-sm2`.)*
+As of `ece482f`, before the wall work of `f4175e3`:
+
+| model | releases | real shape (test / 2024) | box | same-body box |
+|---|---|---|---|---|
+| rac_basic | 2016 to 2023 | 76.5 / 74.6 % | 97.8 to 98.2 % | 99.1 to 99.5 % of 432 |
+| rst_basic | 2016 | 93.4 / 94.3 % | 96.7 % | 96.9 % of 423 |
+| rst_basic | 2017 to 2023 | 95.6 / 94.3 % | 99.6 % | 100 % of 440 to 441 |
+| rac_advanced | 2016 to 2020 | 92.4 / 91.4 % | 96.5 % | 96.9 % of 5,435 |
+| rac_advanced | 2021 to 2023 | 92.2 to 92.4 / 91.2 % | 99.1 to 99.3 % | 99.9 % of 5,479 to 5,494 |
+
+The 32-bit exports draw slightly more elements from saved meshes than 2024's do. Where 2024 has a decoder of its own for an element, it uses that before the mesh; the 32-bit route lacks some of those decoders.
 
 ## Not done
 
 - **Revit 2016 column sections.** A section's sizes there are the family's own parameters, not BuiltInParameters.
-- **Seven walls 2024 draws from their centreline stay record boxes**, and two of the 40 compared walls differ.
 - **Slabs, roofs and stairs** are boxes on both sides on these models; the sketch readers were not opened to the 32-bit route.
