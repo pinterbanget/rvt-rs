@@ -1,7 +1,7 @@
 # R3: shapes for Revit 2016 to 2022
 
 **Date:** 2026-10-06
-**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`, `f4175e3`, and for Revit 2016's sections the commit after `1705a4a`
+**Branch:** `phase-r/r1-identity` (fork), commits `a1a3e2c`, `ece482f`, `f4175e3`, `45547bb`
 **Status:** positive. On 2016 to 2022, the 32-bit route now draws real shapes from three decoders the 2024 route already had. The share of real shapes is level with the 2024 copy, except for column I-sections.
 **Answer key:** as in R1. Autodesk's three sample projects of each release are joined on ElementId with the 2024 copy's export. Scored with `tools/re/cross_release_vs_reference.py`, which now also reports box agreement where both exports draw an element the same way ("same-body").
 **Probes:**
