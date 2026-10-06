@@ -557,6 +557,16 @@ impl Cursor<'_> {
         self.items += 1;
         match f.modifier {
             1..=3 if f.base == 14 => self.pointer(f.modifier == 3),
+            // Revit 2016 and 2017 declare `VarParam.m_pSubst` a pointer with
+            // modifier 4 and no class reference; 2018 drops the field. Only a
+            // null one (a zero token) is decoded: what follows a non-zero
+            // token is not established.
+            4 if f.base == 14 && f.references.is_empty() => {
+                let offset = self.pos;
+                let token = self.u32()?;
+                ensure!(token == 0, "non-null native pointer with modifier 4");
+                Ok(json!({"pointer_token":0,"class_tag":null,"offset":offset}))
+            }
             0x60 if f.base == 8 => {
                 let n = self.u32()? as usize;
                 ensure!(n <= 1_000_000, "native string unit budget exceeded");
