@@ -26,7 +26,7 @@
 use crate::RevitFile;
 use crate::partition_element_records::{
     BBOX_MARKER_OFFSET, BBOX_OFFSET, BUILTIN_CATEGORY_MAX, BUILTIN_CATEGORY_MIN, CLASS_TAG_OFFSET,
-    CONTAINER_OFFSET, PLACEMENT_KIND_OFFSET, PartitionElementRecord,
+    PLACEMENT_KIND_OFFSET, PartitionElementRecord,
 };
 use std::collections::BTreeSet;
 
@@ -50,6 +50,15 @@ pub fn reads_release(revit_version: u32) -> bool {
 const ID_BEFORE_MARKER: usize = 52;
 /// Bytes from the `BuiltInCategory` to the marker.
 const CATEGORY_BEFORE_MARKER: usize = 38;
+/// Bytes from the container reference, a `u32`, to the marker: 16 bytes
+/// after the category, followed by `ff ff ff ff`. The `u64` at 2024's
+/// place relative to the marker (8 bytes after the category) is an
+/// all-`0xFF` run on every record, so read there no 32-bit record was a
+/// container member. Joined on ElementId with the 2024 copy of the same
+/// model, this field gives the container 2024 reads on every shared record
+/// (rac_basic 2016 and 2022: 1,020 and 1,021; rac_advanced 2018 and 2022:
+/// 7,412 and 7,621), where the `u64` misses 9 and 67.
+const CONTAINER_BEFORE_MARKER: usize = 22;
 /// Offset of the `ElementHeader` tag after the ElementId (after the `u32`
 /// id and the `u32` size).
 const HEADER_TAG_AFTER_ID: usize = 8;
@@ -136,12 +145,12 @@ fn decode_at_marker(
         let from = usize::try_from(base + offset as isize).ok()?;
         buf.get(from..from + len)
     };
-    let u64_at = |offset: usize| {
-        field(offset, 8)
-            .and_then(|b| b.try_into().ok())
-            .map(u64::from_le_bytes)
-    };
-    let container = u64_at(CONTAINER_OFFSET)?;
+    let container_at = at.checked_sub(CONTAINER_BEFORE_MARKER)?;
+    let container =
+        match u32::from_le_bytes(buf.get(container_at..container_at + 4)?.try_into().ok()?) {
+            u32::MAX => u64::MAX,
+            id => u64::from(id),
+        };
     let placement_kind = u32::from_le_bytes(field(PLACEMENT_KIND_OFFSET, 4)?.try_into().ok()?);
     let class_tag = u16::from_le_bytes(field(CLASS_TAG_OFFSET, 2)?.try_into().ok()?);
     let mut bbox_feet = [0.0f64; 6];

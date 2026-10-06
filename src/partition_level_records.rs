@@ -160,6 +160,13 @@ pub const PARTITION_LEVEL_SUPPORTED_REVIT_VERSIONS: &[u32] = &[
 /// ElementIds (RE-107).
 pub const REVIT_2023: u32 = 2023;
 
+/// The placement kind of a placed Level on Revit 2016 to 2018:
+/// `0xffffef6f`, where 2019 and later write
+/// [`crate::partition_element_records::PLACEMENT_KIND_INSTANCE`]. Measured on
+/// every Level record of Autodesk's three sample projects of 2016 to 2023;
+/// no other element record of those files carries it.
+pub const PLACEMENT_KIND_LEVEL_2016: u32 = 0xffff_ef6f;
+
 /// Autodesk `BuiltInCategory.OST_Levels`.
 pub const OST_LEVELS: i64 = -2_000_240;
 
@@ -276,6 +283,7 @@ impl PartitionLevelRecord {
     /// True when `+0x42` marks a placed element instance.
     pub fn is_placed_instance(&self) -> bool {
         self.placement_kind == crate::partition_element_records::PLACEMENT_KIND_INSTANCE
+            || self.placement_kind == PLACEMENT_KIND_LEVEL_2016
     }
 
     /// The #211 instance rule, applied to Levels: a standalone placed
@@ -461,14 +469,27 @@ pub const BUILDING_STORY_WINDOW: usize = 0x200;
 /// exact on all 18 architectural and 19 structural Levels (12 stories, 7
 /// not), and it is 1 on Core Interior's 15 and RE1's 2 Levels, every one a
 /// storey of Revit's export. `None` where the frame is not found.
-fn building_story_after(buf: &[u8], name_end: usize) -> Option<bool> {
+///
+/// A 32-bit release (`id_len` 4, Revit 2016 to 2023) writes the unset id
+/// and the ElementId as `u32`s: `ff ff ff ff 00 01`, the `f64`, a `u32`
+/// ElementId and the setting. Measured on Autodesk's `rac_basic` of 2016
+/// and 2022, whose Levels carry Level type 305 there, as 2024's do in the
+/// 64-bit frame.
+fn building_story_after(buf: &[u8], name_end: usize, id_len: usize) -> Option<bool> {
+    const ANCHOR_32: [u8; 6] = [0xff, 0xff, 0xff, 0xff, 0x00, 0x01];
     let window = buf.get(name_end..(name_end + BUILDING_STORY_WINDOW).min(buf.len()))?;
-    let anchor = name_end + find_subslice(window, &BUILDING_STORY_ANCHOR)?;
-    let id_at = anchor + BUILDING_STORY_ANCHOR.len() + 8;
-    if read_u64(buf, id_at)? > u64::from(u32::MAX) {
-        return None;
-    }
-    match buf.get(id_at + 8)? {
+    let setting_at = if id_len == 4 {
+        let anchor = name_end + find_subslice(window, &ANCHOR_32)?;
+        anchor + ANCHOR_32.len() + 8 + 4
+    } else {
+        let anchor = name_end + find_subslice(window, &BUILDING_STORY_ANCHOR)?;
+        let id_at = anchor + BUILDING_STORY_ANCHOR.len() + 8;
+        if read_u64(buf, id_at)? > u64::from(u32::MAX) {
+            return None;
+        }
+        id_at + 8
+    };
+    match buf.get(setting_at)? {
         0 => Some(false),
         1 => Some(true),
         _ => None,
@@ -580,7 +601,7 @@ fn decode_name_block(
         element_id,
         name,
         elevation_feet,
-        building_story: building_story_after(buf, end),
+        building_story: building_story_after(buf, end, id_len),
     })
 }
 
@@ -782,8 +803,9 @@ const ID_BEFORE_CATEGORY_2023: usize = 14;
 /// Bytes from the ElementId to the `ElementHeader` tag, after the `u32` id
 /// and the `u32` record size, as in [`crate::partition_element_records_2023`].
 const HEADER_TAG_AFTER_ID_2023: usize = 8;
-/// Bytes from the category to the container reference.
-const CONTAINER_AFTER_CATEGORY_2023: usize = 8;
+/// Bytes from the category to the container reference, a `u32` (the
+/// 32-bit record's field, see `partition_element_records_2023`).
+const CONTAINER_AFTER_CATEGORY_2023: usize = 16;
 /// Bytes from the category to the placement kind.
 const PLACEMENT_KIND_AFTER_CATEGORY_2023: usize = 24;
 /// Bytes from the category to the record marker.
@@ -824,7 +846,10 @@ pub fn find_level_records_2023(
                 offset: id_at,
                 element_id,
                 flags: read_u32(buf, id_at + 4)?,
-                container: read_u64(buf, category + CONTAINER_AFTER_CATEGORY_2023)?,
+                container: match read_u32(buf, category + CONTAINER_AFTER_CATEGORY_2023)? {
+                    u32::MAX => u64::MAX,
+                    id => u64::from(id),
+                },
                 placement_kind: read_u32(buf, category + PLACEMENT_KIND_AFTER_CATEGORY_2023)?,
             })
         })
