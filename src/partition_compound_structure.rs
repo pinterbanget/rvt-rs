@@ -79,7 +79,9 @@ pub fn scan_wall_lines(
     revit_version: u32,
     walls: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, crate::partition_beam_axes::BoundedLine>> {
-    if !WALL_LINE_SUPPORTED_REVIT_VERSIONS.contains(&revit_version) {
+    if !WALL_LINE_SUPPORTED_REVIT_VERSIONS.contains(&revit_version)
+        && !crate::partition_element_records_2023::reads_release(revit_version)
+    {
         return Ok(BTreeMap::new());
     }
     crate::partition_beam_axes::scan_first_bounded_lines(rf, revit_version, walls)
@@ -95,7 +97,9 @@ pub fn scan_wall_arcs(
     revit_version: u32,
     walls: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, crate::partition_beam_axes::BoundedArc>> {
-    if !WALL_LINE_SUPPORTED_REVIT_VERSIONS.contains(&revit_version) {
+    if !WALL_LINE_SUPPORTED_REVIT_VERSIONS.contains(&revit_version)
+        && !crate::partition_element_records_2023::reads_release(revit_version)
+    {
         return Ok(BTreeMap::new());
     }
     crate::partition_beam_axes::scan_first_bounded_arcs(rf, revit_version, walls)
@@ -392,10 +396,27 @@ pub struct WallOrientation {
 /// the Revit 2026 house's 59 walls and 4 of Core Interior's 360 set it
 /// (RE-126).
 pub fn wall_orientation(data: &[u8]) -> Option<WallOrientation> {
+    wall_orientation_with(data, true)
+}
+
+/// [`wall_orientation`] on a release with or without the word.
+///
+/// Revit 2016 to 2020 write no word: the flip follows the location line
+/// directly. 2021 inserts the word between them, the release that brought
+/// slanted and tapered walls, and on Autodesk's `rac_basic` every wall of
+/// 2021 and later carries 1 there. On 2016 to 2020 every wall is vertical,
+/// so the word is taken as 1. Measured on the 56 walls of `rac_basic` 2020
+/// against 2021: the location line and flip of each match, four bytes
+/// apart.
+pub fn wall_orientation_with(data: &[u8], has_word: bool) -> Option<WallOrientation> {
     let at = memchr::memmem::find(data, &WALL_FLIP_ANCHOR)? + WALL_FLIP_ANCHOR.len();
     let location_line = u32_at(data, at)?;
-    let word = u32_at(data, at + 4)?;
-    let flip = match data.get(at + 8..at + 12)? {
+    let (word, flip_at) = if has_word {
+        (u32_at(data, at + 4)?, at + 8)
+    } else {
+        (1, at + 4)
+    };
+    let flip = match data.get(flip_at..flip_at + 4)? {
         [flip @ (0 | 1), 0, 0, 0] | [flip @ (0 | 1), 1, 0xff, 0xff] => *flip == 1,
         _ => return None,
     };
@@ -435,7 +456,10 @@ pub fn scan_wall_orientations(
                 .unwrap_or(buf.len())
                 .min(hit.saturating_add(LAYER_WINDOW))
                 .min(buf.len());
-            let Some(orientation) = buf.get(id_at + 8..end).and_then(wall_orientation) else {
+            let Some(orientation) = buf
+                .get(id_at + 8..end)
+                .and_then(|data| wall_orientation_with(data, revit_version >= 2021))
+            else {
                 continue;
             };
             match found.get_mut(&id) {

@@ -3684,7 +3684,8 @@ fn attach_wall_layers(rf: &mut RevitFile, revit_version: u32, walls: &mut [Decod
     // A wall of a 32-bit release (2016 to 2023) keeps its record body, cut
     // back at its joins (RE-120), and takes only its layers and exterior
     // side: its location line is not read (RE-114).
-    let centreline_bodies = !envelope_32;
+    let centreline_bodies = true;
+    let _ = envelope_32;
     let type_of = |element: &DecodedElement| {
         element.fields.iter().find_map(|(name, value)| match value {
             InstanceField::ElementId { id, .. } if name == TYPE_ID_FIELD => Some(*id),
@@ -5899,8 +5900,19 @@ fn recover_2023_records(rf: &mut RevitFile, revit_version: u32, out: &mut Partit
         })
         .cloned()
         .collect();
+    // A beam whose data gives its location line is drawn along it, as on
+    // 2024 (RE-49); only a beam without one is cut back at its columns.
+    attach_beam_axes(rf, revit_version, &mut out.products);
+    let has_axis = |beam: &DecodedElement| {
+        beam.fields
+            .iter()
+            .any(|(name, _)| name == BEAM_AXIS_START_FIELDS[0])
+    };
     let beam_trims = crate::element_record_beam_cuts::beam_column_trims(&framing, &columns);
     for beam in out.products.iter_mut() {
+        if has_axis(beam) {
+            continue;
+        }
         if let Some(trim) = beam.id.and_then(|id| beam_trims.get(&id)) {
             apply_beam_column_trim(beam, trim);
         }

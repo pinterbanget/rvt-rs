@@ -311,7 +311,11 @@ fn group_records(
     bytes: &[u8],
     version: u32,
 ) -> Result<Vec<(u64, usize, usize, usize)>> {
-    let id_bytes = if version == 2023 { 4 } else { 8 };
+    let id_bytes = if crate::partition_element_records_2023::reads_release(version) {
+        4
+    } else {
+        8
+    };
     let header = match source.channel {
         101 => id_bytes + 4,
         102 | 103 => id_bytes + 8,
@@ -344,8 +348,21 @@ fn group_records(
         body_sum += length as u64;
         pos = end + 4;
     }
+    // Revit 2016 and 2017 count each record's trailing length in the
+    // group's declared body bytes: on every group of Autodesk's 2016 and 2017
+    // sample projects the records read out exactly, and the declared bytes
+    // exceed their bodies by 4 per record. 2018 and later count the bodies
+    // alone (examples/probe_r3_group_headers.rs).
+    let declared_body = if matches!(version, 2016 | 2017) {
+        source
+            .declared_body_bytes
+            .checked_sub(4 * records.len() as u64)
+            .unwrap_or(u64::MAX)
+    } else {
+        source.declared_body_bytes
+    };
     ensure!(
-        records.len() as u64 == source.declared_objects && body_sum == source.declared_body_bytes,
+        records.len() as u64 == source.declared_objects && body_sum == declared_body,
         "native group record counts/body sizes disagree"
     );
     Ok(records)
@@ -359,7 +376,7 @@ fn extract_records(
 ) -> Result<Summary> {
     let version = file.basic_file_info()?.version;
     ensure!(
-        matches!(version, 2023..=2027),
+        matches!(version, 2016..=2027),
         "native record framing is unvalidated for Revit {version}"
     );
     let preamble = file.native_preamble()?;

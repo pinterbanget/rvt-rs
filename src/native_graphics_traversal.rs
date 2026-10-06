@@ -254,7 +254,7 @@ impl Walker<'_, '_> {
                 }
                 let fields = &info_object.fields;
                 let _transform = read_transform(&fields["m_Trf"])?;
-                if fields["m_GRepId"].as_u64() != Some(0)
+                if !default_grep_id(fields)
                     || fields["m_cda"]["m_pDoc"]["pointer_token"].as_u64() != Some(1)
                     || !fields["m_cda"]["m_pDoc"]["class_tag"].is_null()
                 {
@@ -306,7 +306,7 @@ impl Walker<'_, '_> {
                 let embedded_pointer = &obj.fields["m_oEmbeddedSymbolGRep"];
                 if embedded_pointer["pointer_token"].as_u64() == Some(0) {
                     let info_fields = &self.graph.objects[info].fields;
-                    if info_fields["m_GRepId"].as_u64() != Some(0)
+                    if !default_grep_id(info_fields)
                         || info_fields["m_cda"]["m_pDoc"]["pointer_token"].as_u64() != Some(1)
                         || !info_fields["m_cda"]["m_pDoc"]["class_tag"].is_null()
                     {
@@ -530,5 +530,17 @@ fn condition_at_detail(class: &str, v: &Value, detail_level: i64) -> Result<bool
         Some(4) => Ok(saved <= actual),
         Some(5) => Ok(saved < actual),
         _ => Err("unsupported integer condition comparison".into()),
+    }
+}
+
+/// Whether an `InstanceInfo` names its symbol's default representation:
+/// `m_GRepId` is 0, or the release's schema has no such field. Revit 2016 to
+/// 2022's `InstanceInfo` carries only `m_Trf`, `m_cda` and `m_symbolId`;
+/// `m_GRepId` first appears in 2023's schema, where every instance of
+/// Autodesk's sample projects writes it as 0.
+fn default_grep_id(fields: &serde_json::Value) -> bool {
+    match fields.get("m_GRepId") {
+        None => true,
+        Some(value) => value.as_u64() == Some(0),
     }
 }

@@ -70,8 +70,14 @@ pub const MIN_PLAN_SHARE: f64 = 0.1;
 pub const HORIZONTAL_EPS: f64 = 1e-9;
 
 /// Whether `revit_version` is a release this layout is measured on.
+///
+/// The 32-bit releases (2016 to 2023) are read too: their element data
+/// opens with the same header carrying a `u32` id
+/// ([`crate::partition_names::element_data_layout`]), and the bounded line
+/// after it is the same record.
 pub fn supports_revit_version(revit_version: u32) -> bool {
     BEAM_AXIS_SUPPORTED_REVIT_VERSIONS.contains(&revit_version)
+        || crate::partition_element_records_2023::reads_release(revit_version)
 }
 
 /// A bounded line record.
